@@ -1,0 +1,4 @@
+app_identifier("com.1004cq.imimchat") # 请根据实际情况修改
+apple_id("your-apple-id@example.com") # 请根据实际情况修改
+itc_team_id("your-itc-team-id")       # 请根据实际情况修改
+team_id("your-team-id")               # 请根据实际情况修改

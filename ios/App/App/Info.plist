@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>imimchat</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>GT_MinimumOSVersion</key>
+	<string>15.0</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>imimchat 需要使用摄像头，以便您在视频通话、扫一扫、拍摄朋友圈和更换头像时使用。</string>
+	<key>NSContactsUsageDescription</key>
+	<string>imimchat 可以通过您的通讯录匹配可能认识的好友，您可以随时在设置中关闭。</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>imimchat 使用 Face ID 保护您的账号与加密聊天内容，仅用于本机身份校验。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>imimchat 在同一局域网内进行音视频通话直连以提升通话质量。</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>imimchat 需要在后台持续获取位置，以便进行实时位置共享与位置轨迹记录。如您不需要后台定位，可随时在设置中关闭。</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>imimchat 需要在后台持续获取位置，以便进行实时位置共享与位置轨迹记录。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>imimchat 需要在您使用 App 时获取位置，以便共享位置、发送位置消息及基于位置的聊天功能。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>imimchat 需要使用麦克风，以便您在音视频通话与发送语音消息时被对方听到。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>imimchat 需要将聊天中收到的图片/视频保存到您的相册。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>imimchat 需要访问您的相册，以便选择图片/视频作为聊天内容或头像。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>imimchat 需要语音识别用于语音消息转文字。</string>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+		<string>INStartCallIntent</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<string>voip</string>
+		<string>audio</string>
+		<string>fetch</string>
+		<string>bluetooth-peripheral</string>
+		<string>external-accessory</string>
+		<string>location</string>
+		<string>screen-capture</string>
+		<string>bluetooth-central</string>
+		<string>nearby-interaction</string>
+	</array>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<true/>
+</dict>
+</plist>

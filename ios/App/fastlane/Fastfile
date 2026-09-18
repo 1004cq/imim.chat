@@ -1,0 +1,22 @@
+default_platform(:ios)
+
+platform :ios do
+  desc "Push a new beta build to TestFlight"
+  lane :beta do
+    # 1. 自动增加 build number (可选)
+    # increment_build_number(xcodeproj: "App.xcodeproj")
+
+    # 2. 编译 App
+    build_app(
+      scheme: "App",
+      workspace: "App.xcworkspace",
+      include_bitcode: false,
+      export_method: "app-store"
+    )
+
+    # 3. 上传到 TestFlight
+    upload_to_testflight(
+      skip_waiting_for_build_processing: true
+    )
+  end
+end

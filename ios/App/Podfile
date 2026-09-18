@@ -1,0 +1,14 @@
+platform :ios, '17.6'
+
+project 'App.xcodeproj'
+
+target 'App' do
+  use_frameworks!
+
+  # Tencent Cloud TRTC native SDK. Install with:
+  #   sudo gem install cocoapods
+  #   pod install
+  #
+  # After installation, open App.xcworkspace instead of App.xcodeproj.
+  pod 'TXLiteAVSDK_TRTC'
+end

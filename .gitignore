@@ -1,0 +1,6 @@
+ios/App/DerivedData*/
+ios/App/build/
+ios/App/Downloads/
+ios/App/Packages/
+ios/App/**/*.xcuserstate
+ios/App/**/xcuserdata/
