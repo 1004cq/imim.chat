@@ -16,7 +16,7 @@
 		262CC4A969B44EC0897FECB9 /* MainTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25A30C7EBCDB4155BD7263A9 /* MainTabView.swift */; };
 		2FF0C9A3C4CB4EEFB87BC995 /* QRCodeScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE68EF063E204D88B3FE1D0C /* QRCodeScannerView.swift */; };
 		4F52B4D98AE84C3E9F31A001 /* Kingfisher in Frameworks */ = {isa = PBXBuildFile; productRef = 4F52B4D88AE84C3E9F31A001 /* Kingfisher */; };
-		4F52B4DA8AE84C3E9F31A002 /* TRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 4F52B4DB8AE84C3E9F31A002 /* TRTC */; };
+		4F52B4DA8AE84C3E9F31A002 /* Professional_SwiftPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4F52B4DB8AE84C3E9F31A002 /* Professional_SwiftPM */; };
 		504EC3081FED79650016851F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504EC3071FED79650016851F /* AppDelegate.swift */; };
 		504EC30F1FED79650016851F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
@@ -150,7 +150,7 @@
 			files = (
 				AA000003FIREB000000000003 /* FirebaseMessaging in Frameworks */,
 				4F52B4D98AE84C3E9F31A001 /* Kingfisher in Frameworks */,
-				4F52B4DA8AE84C3E9F31A002 /* TRTC in Frameworks */,
+				4F52B4DA8AE84C3E9F31A002 /* Professional_SwiftPM in Frameworks */,
 				C0DE00000000000000000101 /* SDWebImageSwiftUI in Frameworks */,
 				C0DE00000000000000000102 /* Lottie in Frameworks */,
 				C0DE00000000000000000109 /* Gzip in Frameworks */,
@@ -280,7 +280,7 @@
 			packageProductDependencies = (
 				AA000004FIREB000000000004 /* FirebaseMessaging */,
 				4F52B4D88AE84C3E9F31A001 /* Kingfisher */,
-				4F52B4DB8AE84C3E9F31A002 /* TRTC */,
+				4F52B4DB8AE84C3E9F31A002 /* Professional_SwiftPM */,
 				C0DE00000000000000000107 /* SDWebImageSwiftUI */,
 				C0DE00000000000000000108 /* Lottie */,
 				C0DE0000000000000000010B /* Gzip */,
@@ -320,8 +320,8 @@
 			mainGroup = 504EC2FB1FED79650016851F;
 			packageReferences = (
 				AA000008FIREB000000000008 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
-				4F52B4D78AE84C3E9F31A001 /* XCLocalSwiftPackageReference "Packages/Kingfisher" */,
-				4F52B4DC8AE84C3E9F31A002 /* XCLocalSwiftPackageReference "Packages/TRTC" */,
+				4F52B4D78AE84C3E9F31A001 /* XCRemoteSwiftPackageReference "Kingfisher" */,
+				4F52B4DC8AE84C3E9F31A002 /* XCRemoteSwiftPackageReference "Professional_SwiftPM" */,
 				C0DE00000000000000000105 /* XCRemoteSwiftPackageReference "SDWebImageSwiftUI" */,
 				C0DE00000000000000000106 /* XCRemoteSwiftPackageReference "lottie-ios" */,
 				C0DE0000000000000000010A /* XCRemoteSwiftPackageReference "GzipSwift" */,
@@ -711,18 +711,23 @@
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCLocalSwiftPackageReference section */
-		4F52B4D78AE84C3E9F31A001 /* XCLocalSwiftPackageReference "Packages/Kingfisher" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = Packages/Kingfisher;
-		};
-		4F52B4DC8AE84C3E9F31A002 /* XCLocalSwiftPackageReference "Packages/TRTC" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = Packages/TRTC;
-		};
-/* End XCLocalSwiftPackageReference section */
-
 /* Begin XCRemoteSwiftPackageReference section */
+		4F52B4D78AE84C3E9F31A001 /* XCRemoteSwiftPackageReference "Kingfisher" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/onevcat/Kingfisher.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 8.0.0;
+			};
+		};
+		4F52B4DC8AE84C3E9F31A002 /* XCRemoteSwiftPackageReference "Professional_SwiftPM" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Tencent-RTC/Professional_SwiftPM.git";
+			requirement = {
+				kind = branch;
+				branch = main;
+			};
+		};
 		AA000008FIREB000000000008 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/firebase/firebase-ios-sdk.git";
@@ -760,13 +765,13 @@
 /* Begin XCSwiftPackageProductDependency section */
 		4F52B4D88AE84C3E9F31A001 /* Kingfisher */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 4F52B4D78AE84C3E9F31A001 /* XCLocalSwiftPackageReference "Packages/Kingfisher" */;
+			package = 4F52B4D78AE84C3E9F31A001 /* XCRemoteSwiftPackageReference "Kingfisher" */;
 			productName = Kingfisher;
 		};
-		4F52B4DB8AE84C3E9F31A002 /* TRTC */ = {
+		4F52B4DB8AE84C3E9F31A002 /* Professional_SwiftPM */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 4F52B4DC8AE84C3E9F31A002 /* XCLocalSwiftPackageReference "Packages/TRTC" */;
-			productName = TRTC;
+			package = 4F52B4DC8AE84C3E9F31A002 /* XCRemoteSwiftPackageReference "Professional_SwiftPM" */;
+			productName = Professional_SwiftPM;
 		};
 		AA000004FIREB000000000004 /* FirebaseMessaging */ = {
 			isa = XCSwiftPackageProductDependency;

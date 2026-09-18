@@ -1,5 +1,5 @@
 {
-  "originHash" : "771e2d596a526e714d0917ca11052122d4d9b56465955317647bab4172fbf7c0",
+  "originHash" : "537671f69080303e1060d885a125ec388b8d3b8bf1e99c1359ff5d0a9b91d441",
   "pins" : [
     {
       "identity" : "abseil-cpp-binary",
@@ -101,6 +101,15 @@
       }
     },
     {
+      "identity" : "kingfisher",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/onevcat/Kingfisher.git",
+      "state" : {
+        "revision" : "be0d257b9bd47a4e6e1265fc8c237411825f107a",
+        "version" : "8.12.0"
+      }
+    },
+    {
       "identity" : "leveldb",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/firebase/leveldb.git",
@@ -125,6 +134,15 @@
       "state" : {
         "revision" : "3851d94a41890dea16dc3db34caf60e585cb4163",
         "version" : "2.30910.1"
+      }
+    },
+    {
+      "identity" : "professional_swiftpm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Tencent-RTC/Professional_SwiftPM.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "e506857400f8b9f7df56437fc01388c9ee9fb27b"
       }
     },
     {
