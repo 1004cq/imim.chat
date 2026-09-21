@@ -175,8 +175,14 @@ final class AuthSession: ObservableObject {
     }
 
     func signOut() {
-        PushNotificationManager.shared.unregisterCurrentDevice(authToken: currentUser?.token)
+        let token = currentUser?.token ?? AuthTokenStore.shared.token
+        PushNotificationManager.shared.unregisterCurrentDevice(authToken: token)
         SocketManager.shared.disconnect()
+        if let token, !token.isEmpty {
+            Task {
+                try? await APIClient.shared.logout(authTokenOverride: token)
+            }
+        }
         currentUser = nil
         userDefaults.removeObject(forKey: userKey)
         userDefaults.removeObject(forKey: tokenKey)

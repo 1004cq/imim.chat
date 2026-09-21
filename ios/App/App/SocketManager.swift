@@ -8,15 +8,15 @@ class SocketManager: NSObject, ObservableObject {
     @Published var lastReceivedMessage: Message?
 
     private var webSocketTask: URLSessionWebSocketTask?
-    private var url: URL {
-        var components = URLComponents(string: "wss://wed.imim.chat/signal")!
-        let token = AuthTokenStore.shared.token
-        let userId = UserDefaults.standard.string(forKey: "current_user_id") ?? "ios"
-        components.queryItems = [
-            URLQueryItem(name: "userId", value: userId),
-            URLQueryItem(name: "token", value: token)
-        ].filter { $0.value?.isEmpty == false }
-        return components.url!
+    private var signalURL: URL {
+        URL(string: "wss://wed.imim.chat/signal")!
+    }
+
+    private func makeSocketRequest() -> URLRequest? {
+        guard let token = AuthTokenStore.shared.token, !token.isEmpty else { return nil }
+        var request = URLRequest(url: signalURL)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return request
     }
     private var pingTimer: Timer?
     private var reconnectWorkItem: DispatchWorkItem?
@@ -36,8 +36,9 @@ class SocketManager: NSObject, ObservableObject {
 
         reconnectEnabled = true
         closeConnection()
+        guard let request = makeSocketRequest() else { return }
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: OperationQueue())
-        webSocketTask = session.webSocketTask(with: url)
+        webSocketTask = session.webSocketTask(with: request)
         webSocketTask?.resume()
         receiveMessage()
         startPinging()
@@ -175,7 +176,7 @@ class SocketManager: NSObject, ObservableObject {
                 @unknown default:
                     break
                 }
-                self.receiveMessage() // 继续监听
+                self.receiveMessage()
             case .failure(let error):
                 print("WebSocket 接收失败: \(error)")
                 DispatchQueue.main.async {
@@ -196,9 +197,6 @@ class SocketManager: NSObject, ObservableObject {
                       let remoteMessage = try? JSONDecoder().decode(RemoteMessage.self, from: payload) else { return }
                 let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
                 let isAck = envelope.payloadContainsAck
-                // Decryption can include a keychain lookup and a complete
-                // ratchet step. Keep that work off the UI actor so an incoming
-                // web message never stalls typing or scrolling.
                 Task { [weak self] in
                     guard let self else { return }
                     let senderName = remoteMessage.senderName?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -222,10 +220,6 @@ class SocketManager: NSObject, ObservableObject {
                             userInfo: ["ack": isAck]
                         )
 
-                        // A foreground WebSocket message does not pass through
-                        // UNUserNotificationCenter. Route it through the same
-                        // in-app banner channel used by APNs so web -> iOS has
-                        // visible feedback without duplicating the active chat.
                         if !isAck,
                            NotificationRouter.shared.activeConversationId != message.chatId,
                            !ConversationPreferences.isMuted(for: message.chatId) {
