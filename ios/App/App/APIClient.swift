@@ -363,11 +363,13 @@ class APIClient {
         let _: EmptyResponse = try await request("/chat/\(chatId)/read", method: "POST", body: body)
     }
 
+    /// Uploads the APNs device token. The server only exposes `/apns/token`
+    /// and reads the `environment` field, so call it directly.
     func registerPushToken(token: String, env: PushTokenEnvironment, appVersion: String?) async throws {
         var body: [String: Any] = [
             "token": token,
             "platform": "ios",
-            "env": env.rawValue,
+            "environment": env.rawValue,
             "bundleId": Bundle.main.bundleIdentifier ?? ""
         ]
         if let appVersion, !appVersion.isEmpty {
@@ -375,19 +377,18 @@ class APIClient {
         }
         // The authenticated bearer token is the user binding. Do not trust a
         // userId supplied by the client, which would allow token reassignment.
-        do {
-            let _: EmptyResponse = try await request("/device/push-token", method: "POST", body: body)
-        } catch {
-            // Existing production nodes still expose the compatibility route.
-            let _: EmptyResponse = try await request("/apns/token", method: "POST", body: body)
-        }
+        let _: EmptyResponse = try await request("/apns/token", method: "POST", body: body)
     }
 
-    func registerVoIPToken(_ token: String) async throws {
+    func registerVoIPToken(_ token: String, environment: PushTokenEnvironment? = nil) async throws {
+        var body: [String: Any] = ["voipToken": token]
+        if let environment {
+            body["environment"] = environment.rawValue
+        }
         let _: EmptyResponse = try await request(
             "/apns/voip-token",
             method: "POST",
-            body: ["voipToken": token]
+            body: body
         )
     }
 
@@ -409,12 +410,16 @@ class APIClient {
         }
     }
 
+    /// Reports foreground/background presence. The server exposes
+    /// `POST /api/presence` and reads the `state` field
+    /// ("foreground" | "background" | "offline"), which is what decides
+    /// whether an incoming message triggers an APNs push.
     func updatePushPresence(_ presence: String, activeChatId: String? = nil) async throws {
-        var body: [String: Any] = ["presence": presence]
+        var body: [String: Any] = ["state": presence]
         if let activeChatId, !activeChatId.isEmpty {
             body["activeChatId"] = activeChatId
         }
-        let _: EmptyResponse = try await request("/device/presence", method: "POST", body: body)
+        let _: EmptyResponse = try await request("/presence", method: "POST", body: body)
     }
 
     func recallMessage(chatId: String, messageId: String) async throws {

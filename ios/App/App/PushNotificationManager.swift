@@ -216,7 +216,7 @@ final class PushNotificationManager: ObservableObject {
         }
 
         do {
-            try await APIClient.shared.registerVoIPToken(token)
+            try await APIClient.shared.registerVoIPToken(token, environment: currentAPNsEnvironment())
             lastErrorMessage = nil
             print("[Push] VoIP token uploaded")
         } catch {

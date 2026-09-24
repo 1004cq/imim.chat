@@ -326,6 +326,14 @@ struct ChatDetailView: View {
                 guard !isLoading else { return }
                 restoreScrollPositionIfNeeded(proxy: proxy, messageItems: messageItems)
             }
+            .onChange(of: socket.isConnected) { _, isConnected in
+                // The socket dropped and came back while this chat was open:
+                // pull anything that arrived in between.
+                guard isConnected else { return }
+                Task {
+                    await viewModel.syncAfterReconnect(for: chat, modelContext: modelContext)
+                }
+            }
             .onPreferenceChange(MessageViewportPreferenceKey.self) { positions in
                 guard let visible = positions
                     .filter({ $0.value >= 0 })

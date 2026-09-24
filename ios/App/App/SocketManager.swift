@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Network
 
 class SocketManager: NSObject, ObservableObject {
     static let shared = SocketManager()
@@ -20,12 +21,21 @@ class SocketManager: NSObject, ObservableObject {
     }
     private var pingTimer: Timer?
     private var reconnectWorkItem: DispatchWorkItem?
+    private var reconnectAttempt = 0
+    private var pathMonitor: NWPathMonitor?
     private var isBackgrounded = false
     private var reconnectEnabled = false
     private var lastEncryptionResetRequest: [String: Date] = [:]
 
+    /// Reuse one URLSession for the lifetime of the app instead of creating a
+    /// new one on every (re)connect.
+    private lazy var session: URLSession = {
+        URLSession(configuration: .default, delegate: self, delegateQueue: OperationQueue())
+    }()
+
     private override init() {
         super.init()
+        startPathMonitoring()
     }
 
     func connect() {
@@ -36,7 +46,6 @@ class SocketManager: NSObject, ObservableObject {
 
         reconnectEnabled = true
         closeConnection()
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: OperationQueue())
         webSocketTask = session.webSocketTask(with: url)
         webSocketTask?.resume()
         receiveMessage()
@@ -45,6 +54,7 @@ class SocketManager: NSObject, ObservableObject {
 
     func disconnect() {
         reconnectEnabled = false
+        reconnectAttempt = 0
         closeConnection()
     }
 
@@ -53,6 +63,7 @@ class SocketManager: NSObject, ObservableObject {
     func enterBackground() {
         isBackgrounded = true
         reconnectEnabled = false
+        reconnectAttempt = 0
         closeConnection()
     }
 
@@ -60,38 +71,6 @@ class SocketManager: NSObject, ObservableObject {
         isBackgrounded = false
         guard AuthTokenStore.shared.token?.isEmpty == false else { return }
         connect()
-    }
-
-    func sendPrivateMessage(
-        chatId: String,
-        encryptedEnvelope: String,
-        tempId: String,
-        extra: [String: Any]? = nil
-    ) {
-        guard let validatedEnvelope = try? E2EEManager.shared.validateEnvelopeString(encryptedEnvelope) else {
-            DispatchQueue.main.async {
-                NotificationCenter.default.post(
-                    name: .cqimSocketErrorDidReceive,
-                    object: E2EEError.invalidEnvelope.localizedDescription
-                )
-            }
-            return
-        }
-        var messagePayload: [String: Any] = [
-            "chatId": chatId,
-            "content": validatedEnvelope,
-            "msgType": "encrypted",
-            "tempId": tempId
-        ]
-        if let extra {
-            messagePayload["extra"] = extra
-        }
-
-        let payload: [String: Any] = [
-            "type": "private_send",
-            "payload": messagePayload
-        ]
-        sendJSON(payload)
     }
 
     func sendReadReceipt(chatId: String, messageIds: [String], to peerId: String?) {
@@ -351,14 +330,38 @@ class SocketManager: NSObject, ObservableObject {
 
     private func scheduleReconnect() {
         guard reconnectEnabled, !isBackgrounded, reconnectWorkItem == nil else { return }
+        // Exponential backoff: 5s, 10s, 20s, 40s, capped at 60s. A fixed 5s
+        // retry burns battery on flaky networks without connecting faster.
+        let delay = min(5.0 * pow(2.0, Double(reconnectAttempt)), 60.0)
+        reconnectAttempt += 1
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.reconnectEnabled, !self.isBackgrounded else { return }
-            print("尝试重新连接 WebSocket...")
+            print("尝试重新连接 WebSocket... (第 \(self.reconnectAttempt) 次)")
             self.reconnectWorkItem = nil
             self.connect()
         }
         reconnectWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    /// Reconnect promptly when the network comes back instead of waiting for
+    /// the next backoff tick.
+    private func startPathMonitoring() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            guard path.status == .satisfied,
+                  self.reconnectEnabled,
+                  !self.isBackgrounded,
+                  self.webSocketTask == nil else { return }
+            print("网络恢复，重新连接 WebSocket...")
+            self.reconnectAttempt = 0
+            self.reconnectWorkItem?.cancel()
+            self.reconnectWorkItem = nil
+            DispatchQueue.main.async { self.connect() }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .background))
+        pathMonitor = monitor
     }
 }
 
@@ -380,13 +383,12 @@ private struct SocketEnvelope: Decodable {
     let from: String?
     let to: String?
     let payload: Data?
+    /// The payload parsed once as a dictionary. The accessors below used to
+    /// re-run JSONSerialization on every access, once per incoming message.
+    let payloadObject: [String: Any]?
 
     var payloadContainsAck: Bool {
-        guard let payload,
-              let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
-            return false
-        }
-        return object["ack"] as? Bool == true
+        payloadObject?["ack"] as? Bool == true
     }
 
     var callUserInfo: [String: Any] {
@@ -394,8 +396,7 @@ private struct SocketEnvelope: Decodable {
         if let from { info["from"] = from }
         if let to { info["to"] = to }
 
-        guard let payload,
-              let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+        guard let object = payloadObject else {
             return info
         }
 
@@ -416,8 +417,7 @@ private struct SocketEnvelope: Decodable {
     }
 
     var errorMessage: String {
-        guard let payload,
-              let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+        guard let object = payloadObject else {
             return "WebSocket 请求失败"
         }
         return object["error"] as? String ?? object["message"] as? String ?? "WebSocket 请求失败"
@@ -444,8 +444,10 @@ private struct SocketEnvelope: Decodable {
         if container.contains(.payload) {
             let raw = try container.decode(RawJSON.self, forKey: .payload)
             payload = raw.data
+            payloadObject = try? JSONSerialization.jsonObject(with: raw.data) as? [String: Any]
         } else {
             payload = nil
+            payloadObject = nil
         }
     }
 }
@@ -504,6 +506,7 @@ extension Notification.Name {
 
 extension SocketManager: URLSessionWebSocketDelegate {
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        reconnectAttempt = 0
         DispatchQueue.main.async {
             self.isConnected = true
             print("WebSocket 已连接")
