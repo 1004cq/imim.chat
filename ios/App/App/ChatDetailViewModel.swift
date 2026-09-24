@@ -46,6 +46,21 @@ final class ChatDetailViewModel: ObservableObject {
         }
     }
 
+    /// Pulls the latest messages after the socket reconnects, so messages
+    /// that arrived while offline appear without reopening the chat.
+    /// `merge` dedups by messageId, making this safe to call on every reconnect.
+    func syncAfterReconnect(for chat: Chat, modelContext: ModelContext) async {
+        guard AuthTokenStore.shared.token != nil else { return }
+        do {
+            let remoteMessages = try await APIClient.shared.fetchMessages(chatId: chat.chatId)
+            await merge(remoteMessages: remoteMessages, into: chat)
+            chat.unreadCount = 0
+            save(modelContext)
+        } catch {
+            print("[Chat] reconnect sync failed: \(error.localizedDescription)")
+        }
+    }
+
     /// A retry for ciphertext that was encrypted to a discarded device key
     /// must create a new ratchet. Reloading the same ciphertext cannot recover
     /// a private key that is no longer on this device.

@@ -286,14 +286,25 @@ final class E2EEManager {
             print("[E2EE] bundle registered force=\(forceBundleRegistration) registration=\(registration.registrationId)")
         }
 
-        let count = (try? await APIClient.shared.fetchE2EEPreKeyCount(userId: userId)) ?? 0
-        if count < 5 {
-            let startId = max(registration.nextPreKeyId, Int(Date().timeIntervalSince1970) % 100_000)
-            let newKeys = try generatePreKeys(userId: userId, startId: startId, count: 20)
-            var updated = registration
-            updated.nextPreKeyId = startId + 20
-            try keychain.saveRegistration(updated, userId: userId)
-            try await APIClient.shared.replenishE2EEPreKeys(userId: userId, preKeys: newKeys)
+        // The one-time prekey count only changes when other devices consume
+        // our keys, which is slow. Checking it on every encrypt/decrypt adds
+        // a network round-trip to each message, so throttle to once per hour.
+        let checkKey = "e2ee_prekey_last_check_\(userId)"
+        let lastCheck = UserDefaults.standard.double(forKey: checkKey)
+        let shouldCheck = forceBundleRegistration
+            || didCreateRegistration
+            || Date().timeIntervalSince1970 - lastCheck > 3600
+        if shouldCheck {
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: checkKey)
+            let count = (try? await APIClient.shared.fetchE2EEPreKeyCount(userId: userId)) ?? 0
+            if count < 5 {
+                let startId = max(registration.nextPreKeyId, Int(Date().timeIntervalSince1970) % 100_000)
+                let newKeys = try generatePreKeys(userId: userId, startId: startId, count: 20)
+                var updated = registration
+                updated.nextPreKeyId = startId + 20
+                try keychain.saveRegistration(updated, userId: userId)
+                try await APIClient.shared.replenishE2EEPreKeys(userId: userId, preKeys: newKeys)
+            }
         }
     }
 
