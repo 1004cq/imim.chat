@@ -261,6 +261,7 @@ private struct ConversationCell: View {
                 DoveAvatar(
                     name: conversation.title,
                     url: conversation.avatarURL,
+                    userId: chat.avatarPeerUserId,
                     size: 56,
                     isGroup: conversation.isGroup,
                     isOnline: conversation.isOnline
@@ -589,7 +590,7 @@ private struct CreateGroupSheet: View {
                         ForEach(selectedFriends) { friend in
                             VStack(spacing: 4) {
                                 ZStack(alignment: .topTrailing) {
-                                    DoveAvatar(name: friend.name, url: friend.avatar, size: 38)
+                                    DoveAvatar(name: friend.name, url: friend.avatar, userId: friend.id, size: 38)
                                     Button {
                                         selectedIds.remove(friend.id)
                                     } label: {
@@ -643,7 +644,7 @@ private struct CreateGroupSheet: View {
                                             .font(.system(size: 21, weight: .semibold))
                                             .foregroundStyle(selectedIds.contains(friend.id) ? DoveTheme.green : .secondary.opacity(0.45))
 
-                                        DoveAvatar(name: friend.name, url: friend.avatar, size: 42, isOnline: friend.online == true)
+                                        DoveAvatar(name: friend.name, url: friend.avatar, userId: friend.id, size: 42, isOnline: friend.online == true)
 
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text(friend.name)
@@ -696,7 +697,7 @@ private struct CreateGroupSheet: View {
         VStack(spacing: 16) {
             HStack(spacing: -6) {
                 ForEach(selectedFriends.prefix(5)) { friend in
-                    DoveAvatar(name: friend.name, url: friend.avatar, size: 42)
+                    DoveAvatar(name: friend.name, url: friend.avatar, userId: friend.id, size: 42)
                 }
                 if selectedFriends.count > 5 {
                     Text("+\(selectedFriends.count - 5)")
@@ -880,7 +881,7 @@ private struct MyQRCodeSheet: View {
                     .padding(.top, 10)
 
                 VStack(spacing: 14) {
-                    DoveAvatar(name: userName, url: avatar, size: 72)
+                    DoveAvatar(name: userName, url: avatar, userId: userId, size: 72)
 
                     VStack(spacing: 4) {
                         Text(userName)

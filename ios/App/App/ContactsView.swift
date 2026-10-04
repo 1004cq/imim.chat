@@ -339,6 +339,7 @@ private struct ContactRow: View {
             DoveAvatar(
                 name: item.name,
                 url: item.avatar,
+                userId: item.avatarUserId,
                 size: 52,
                 isGroup: item.isGroup,
                 isOnline: item.isOnline
@@ -397,6 +398,13 @@ private struct ContactListItem: Identifiable {
         switch source {
         case .friend(let friend): friend.avatar
         case .chat(let chat): chat.avatar
+        }
+    }
+
+    var avatarUserId: String? {
+        switch source {
+        case .friend(let friend): friend.id
+        case .chat(let chat): chat.avatarPeerUserId
         }
     }
 

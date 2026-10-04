@@ -219,7 +219,7 @@ struct ChatSettingsView: View {
 
     private var profileHeader: some View {
         VStack(spacing: 10) {
-            DoveAvatar(name: chat.name, url: chat.avatar, size: 76, isGroup: chat.type == "group")
+            DoveAvatar(name: chat.name, url: chat.avatar, userId: chat.avatarPeerUserId, size: 76, isGroup: chat.type == "group")
             Text(chat.name).font(.title3.weight(.semibold)).foregroundStyle(DoveTheme.ink)
             Text(chat.type == "group" ? "群聊" : "端到端加密私聊")
                 .font(.footnote).foregroundStyle(.secondary)

@@ -53,6 +53,7 @@ struct AddFriendView: View {
                                     DoveAvatar(
                                         name: user.nickname ?? user.username,
                                         url: user.avatar,
+                                        userId: user.id,
                                         size: 42
                                     )
 

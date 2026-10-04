@@ -56,13 +56,14 @@ enum DoveTheme {
 struct DoveAvatar: View {
     let name: String
     var url: String?
+    var userId: String? = nil
     var size: CGFloat = 48
     var isGroup = false
     var isOnline = false
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            avatarContent
+            DoveAvatarImage(name: name, url: url, userId: userId, size: size, isGroup: isGroup)
                 .frame(width: size, height: size)
                 .clipShape(Circle())
                 .overlay(Circle().stroke(DoveTheme.paper.opacity(0.9), lineWidth: 2))
@@ -78,57 +79,31 @@ struct DoveAvatar: View {
         .accessibilityLabel(name)
     }
 
-    @ViewBuilder
-    private var avatarContent: some View {
-        if let image = AvatarStore.image(from: url) {
-            Image(uiImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-        } else if let url, let imageURL = remoteImageURL(from: url) {
-            KFImage(imageURL)
-                .placeholder {
-                    placeholder
-                }
-                .retry(maxCount: 2, interval: .seconds(1))
-                .cacheOriginalImage()
-                .fade(duration: 0.18)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-        } else {
-            placeholder
-        }
+}
+
+/// Both surfaces use the same Kingfisher coordinator and stable cache key.
+/// No URL-keyed SwiftUI task can blank an already cached avatar during refresh.
+private struct DoveAvatarImage: UIViewRepresentable {
+    let name: String
+    let url: String?
+    let userId: String?
+    let size: CGFloat
+    let isGroup: Bool
+
+    func makeUIView(context: Context) -> UIImageView {
+        let view = UIImageView(frame: CGRect(x: 0, y: 0, width: size, height: size))
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        updateUIView(view, context: context)
+        return view
     }
 
-    private func remoteImageURL(from value: String) -> URL? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.lowercased() != "null" else { return nil }
-        if trimmed.hasPrefix("/") {
-            return URL(string: "https://wed.imim.chat\(trimmed)")
-        }
-        guard let url = URL(string: trimmed),
-              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
-            return nil
-        }
-        return url
+    func updateUIView(_ view: UIImageView, context: Context) {
+        AvatarImageLoader.loadAvatar(urlString: url, userId: userId, name: name, isGroup: isGroup, into: view)
     }
 
-    private var placeholder: some View {
-        ZStack {
-            LinearGradient(
-                colors: isGroup ? [DoveTheme.green, Color.teal] : [DoveTheme.greenSoft, DoveTheme.warmGray],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            if isGroup {
-                Image(systemName: "person.2.fill")
-                    .font(.system(size: size * 0.38, weight: .semibold))
-                    .foregroundStyle(.white)
-            } else {
-                Text(String(name.prefix(1)))
-                    .font(.system(size: size * 0.38, weight: .semibold, design: .rounded))
-                    .foregroundStyle(DoveTheme.green)
-            }
-        }
+    static func dismantleUIView(_ view: UIImageView, coordinator: ()) {
+        AvatarImageLoader.shared.unbind(view)
     }
 }
 

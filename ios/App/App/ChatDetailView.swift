@@ -955,7 +955,7 @@ private struct MessageBubble: View {
             if message.isOutgoing {
                 Spacer(minLength: DoveTheme.Chat.avatarSize + 16)
             } else {
-                DoveAvatar(name: peerName, url: peerAvatar, size: DoveTheme.Chat.avatarSize)
+                DoveAvatar(name: peerName, url: peerAvatar, userId: message.senderId, size: DoveTheme.Chat.avatarSize)
                     .padding(.top, 4)
             }
 
@@ -1229,7 +1229,7 @@ private struct HeaderIconButton: View {
 @MainActor
 private struct AuthenticatedRemoteImage<Failure: View>: View {
     let url: URL
-    var contentMode: ContentMode = .fill
+    var contentMode: SwiftUI.ContentMode = .fill
     @ViewBuilder var failure: () -> Failure
 
     @State private var image: UIImage?

@@ -73,6 +73,7 @@ struct SettingsView: View {
                     DoveAvatar(
                         name: displayName,
                         url: currentUser?.avatar,
+                        userId: currentUser?.id,
                         size: 82
                     )
                 }
@@ -364,7 +365,7 @@ private struct SavedChatsPanel: View {
                         ChatDetailView(chat: chat)
                     } label: {
                         HStack(spacing: 12) {
-                            DoveAvatar(name: chat.name, url: chat.avatar, size: 42, isGroup: chat.type == "group")
+                            DoveAvatar(name: chat.name, url: chat.avatar, userId: chat.avatarPeerUserId, size: 42, isGroup: chat.type == "group")
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(chat.name)
                                     .foregroundStyle(DoveTheme.ink)

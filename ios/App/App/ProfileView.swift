@@ -27,6 +27,7 @@ struct ProfileView: View {
                             DoveAvatar(
                                 name: currentUser?.nickname ?? "我",
                                 url: currentUser?.avatar,
+                                userId: currentUser?.id,
                                 size: 72
                             )
 

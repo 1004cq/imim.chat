@@ -133,7 +133,7 @@ struct VideoCallView: View {
     private var audioStage: some View {
         VStack(spacing: 18) {
             Spacer()
-            DoveAvatar(name: viewModel.session.peerName, url: viewModel.session.peerAvatar, size: 132)
+            DoveAvatar(name: viewModel.session.peerName, url: viewModel.session.peerAvatar, userId: viewModel.session.peerId, size: 132)
                 .overlay(VolumeRing(volume: trtc.remoteParticipants.first?.volume ?? 0).padding(-10))
             Text(viewModel.session.peerName)
                 .font(.system(size: 28, weight: .semibold))
@@ -315,7 +315,7 @@ struct VideoCallView: View {
                     endPoint: .bottomTrailing
                 )
                 VStack(spacing: 6) {
-                    DoveAvatar(name: viewModel.session.peerName, url: viewModel.session.peerAvatar, size: 42)
+                    DoveAvatar(name: viewModel.session.peerName, url: viewModel.session.peerAvatar, userId: viewModel.session.peerId, size: 42)
                     Text(viewModel.statusText)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.86))
