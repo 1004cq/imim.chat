@@ -103,7 +103,7 @@ struct VideoCallView: View {
                 Color.black
                 VStack(spacing: 12) {
                     DoveAvatar(name: "我", size: 104)
-                    Text(trtc.isMuted ? "已静音" : "我")
+                    Text(trtc.isMuted ? AppLocalization.text("已静音") : AppLocalization.text("我"))
                         .font(.system(size: 16, weight: .medium))
                         .foregroundStyle(.white.opacity(0.86))
                 }
@@ -119,7 +119,7 @@ struct VideoCallView: View {
                 Color.black
                 VStack(spacing: 8) {
                     DoveAvatar(name: "我", size: 44)
-                    Text(trtc.isMuted ? "已静音" : "我")
+                    Text(trtc.isMuted ? AppLocalization.text("已静音") : AppLocalization.text("我"))
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.86))
                 }
@@ -138,7 +138,7 @@ struct VideoCallView: View {
             Text(viewModel.session.peerName)
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundStyle(.white)
-            Text(viewModel.statusText)
+            AppLocalizedText(viewModel.statusText)
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.white.opacity(0.72))
             Spacer()
@@ -160,10 +160,10 @@ struct VideoCallView: View {
             Spacer()
 
             VStack(spacing: 3) {
-                Text(callHeaderTitle)
+                AppLocalizedText(callHeaderTitle)
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(.white)
-                Text(callHeaderSubtitle)
+                AppLocalizedText(callHeaderSubtitle)
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.66))
             }
@@ -191,7 +191,7 @@ struct VideoCallView: View {
     private var statusPanel: some View {
         if viewModel.session.isIncoming && viewModel.session.status == .ringing {
             VStack(spacing: 14) {
-                Text("\(viewModel.session.peerName) 邀请你进行\(viewModel.session.callType.title)")
+                Text("\(viewModel.session.peerName) 邀请你进行\(AppLocalization.string(viewModel.session.callType.title))")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(.white)
                     .multilineTextAlignment(.center)
@@ -208,7 +208,7 @@ struct VideoCallView: View {
             }
             .padding(.bottom, 18)
         } else if viewModel.session.status == .failed, let errorMessage = viewModel.errorMessage {
-            Text(errorMessage)
+            AppLocalizedText(errorMessage)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
@@ -216,7 +216,7 @@ struct VideoCallView: View {
                 .background(Color.red.opacity(0.8), in: Capsule())
                 .padding(.bottom, 12)
         } else if let mediaWarning = trtc.mediaWarning {
-            Text(mediaWarning)
+            AppLocalizedText(mediaWarning)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
@@ -316,7 +316,7 @@ struct VideoCallView: View {
                 )
                 VStack(spacing: 6) {
                     DoveAvatar(name: viewModel.session.peerName, url: viewModel.session.peerAvatar, size: 42)
-                    Text(viewModel.statusText)
+                    AppLocalizedText(viewModel.statusText)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.86))
                         .lineLimit(1)
@@ -370,7 +370,7 @@ struct VideoCallView: View {
 
     private var callHeaderTitle: String {
         if !viewModel.session.isIncoming, !hasRemoteVideo, viewModel.session.status != .failed {
-            return "正在呼叫 \(viewModel.session.peerName)"
+            return AppLocalization.text("正在呼叫 \(viewModel.session.peerName)")
         }
         return viewModel.session.callType.title
     }
@@ -412,7 +412,7 @@ private struct CallControlButton: View {
                     .foregroundStyle(.white)
                     .frame(width: 46, height: 46)
                     .background(isActive ? DoveTheme.green.opacity(0.9) : .white.opacity(0.16), in: Circle())
-                Text(title)
+                AppLocalizedText(title)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.78))
                     .lineLimit(1)
@@ -437,7 +437,7 @@ private struct CallRoundButton: View {
                     .frame(width: 58, height: 58)
                     .background(color, in: Circle())
                     .shadow(color: color.opacity(0.35), radius: 18, y: 8)
-                Text(title)
+                AppLocalizedText(title)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.84))
             }

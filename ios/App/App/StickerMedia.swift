@@ -65,7 +65,7 @@ enum CQIMMediaURL {
             return url
         }
         let normalized = value.hasPrefix("/") ? String(value.dropFirst()) : value
-        return URL(string: "https://wed.imim.chat/\(normalized)")
+        return URL(string: "\(AppServer.origin)/\(normalized)")
     }
 }
 
@@ -173,14 +173,14 @@ private actor StickerAnimationDataCache {
 struct StickerAssetView: View {
     let source: StickerRenderSource
     let size: CGFloat
-    let contentMode: ContentMode
+    let contentMode: SwiftUI.ContentMode
 
     @ObservedObject private var playback = StickerPlaybackCoordinator.shared
     @State private var isVisible = false
     @State private var isAnimating = false
     @State private var hasFailed = false
 
-    init(source: StickerRenderSource, size: CGFloat = 118, contentMode: ContentMode = .fit) {
+    init(source: StickerRenderSource, size: CGFloat = 118, contentMode: SwiftUI.ContentMode = .fit) {
         self.source = source
         self.size = size
         self.contentMode = contentMode
@@ -339,6 +339,7 @@ struct StickerMediaPanel: View {
 
     let onSelectEmoji: (String) -> Void
     let onSelectSticker: (StickerItem, StickerPack?) -> Void
+    let onDismiss: () -> Void
 
     @State private var tab: Tab = .emoji
     @State private var packs: [StickerPack] = []
@@ -351,12 +352,24 @@ struct StickerMediaPanel: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            Picker("媒体类别", selection: $tab) {
-                ForEach(Tab.allCases) { tab in
-                    Label(tab.rawValue, systemImage: tab.icon).tag(tab)
+            HStack(spacing: 10) {
+                Picker("媒体类别", selection: $tab) {
+                    ForEach(Tab.allCases) { tab in
+                        Label(LocalizedStringKey(tab.rawValue), systemImage: tab.icon).tag(tab)
+                    }
                 }
+                .pickerStyle(.segmented)
+
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 32, height: 32)
+                        .background(Color(uiColor: .tertiarySystemFill), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭表情贴纸")
             }
-            .pickerStyle(.segmented)
 
             if tab == .emoji {
                 emojiGrid
@@ -391,13 +404,13 @@ struct StickerMediaPanel: View {
             ProgressView().frame(maxWidth: .infinity, minHeight: 144)
         } else if let loadError {
             VStack(spacing: 8) {
-                Text(loadError).font(.footnote).foregroundStyle(.secondary)
+                AppLocalizedText(loadError).font(.footnote).foregroundStyle(.secondary)
                 Button("重新加载") { Task { await reloadPacks() } }
                     .buttonStyle(.bordered)
             }
             .frame(maxWidth: .infinity, minHeight: 144)
         } else if filteredPacks.isEmpty {
-            ContentUnavailableView(tab == .gif ? "暂无 GIF" : "暂无贴纸", systemImage: "sparkles")
+            ContentUnavailableView(tab == .gif ? AppLocalization.text("暂无 GIF") : AppLocalization.text("暂无贴纸"), systemImage: "sparkles")
                 .frame(maxWidth: .infinity, minHeight: 144)
         } else {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -428,7 +441,7 @@ struct StickerMediaPanel: View {
                                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel(item.name ?? item.emoji ?? "贴纸")
+                            .accessibilityLabel(item.name ?? item.emoji ?? AppLocalization.text("贴纸"))
                         }
                     }
                     .padding(.vertical, 2)

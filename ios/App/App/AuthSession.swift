@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SwiftData
 
 struct CurrentUser: Codable, Equatable {
     var id: String
@@ -15,6 +16,9 @@ final class AuthSession: ObservableObject {
     @Published private(set) var currentUser: CurrentUser?
     @Published var isLoading = false
     @Published var errorMessage: String?
+    @Published private(set) var isDeletingAccount = false
+    @Published var showAccountDeletionNotice = false
+    @Published private(set) var accountDeletionNotice = ""
 
     private let userDefaults: UserDefaults
     private let userKey = "current_user"
@@ -31,15 +35,17 @@ final class AuthSession: ObservableObject {
 
     func signIn(account: String, password: String) async {
         let normalizedAccount = account.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Passwords are opaque credentials. Do not trim or normalize them;
+        // legacy accounts may legitimately contain leading/trailing spaces.
+        let loginPassword = password
 
-        guard normalizedAccount.count >= 3 else {
+        guard !normalizedAccount.isEmpty else {
             errorMessage = "请输入有效的用户 ID、邮箱或手机号"
             return
         }
 
-        guard normalizedPassword.count >= 6 else {
-            errorMessage = "请输入至少 6 位密码"
+        guard !loginPassword.isEmpty else {
+            errorMessage = "请输入密码"
             return
         }
 
@@ -48,7 +54,7 @@ final class AuthSession: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let response = try await APIClient.shared.login(account: normalizedAccount, password: normalizedPassword)
+            let response = try await APIClient.shared.login(account: normalizedAccount, password: loginPassword)
             completeAuthentication(with: response)
         } catch {
             errorMessage = error.localizedDescription
@@ -181,9 +187,55 @@ final class AuthSession: ObservableObject {
         userDefaults.removeObject(forKey: userKey)
         userDefaults.removeObject(forKey: tokenKey)
         userDefaults.removeObject(forKey: "current_user_id")
+        userDefaults.removeObject(forKey: "current_user_account")
         userDefaults.removeObject(forKey: "current_user_name")
         userDefaults.removeObject(forKey: "current_user_avatar")
         AuthTokenStore.shared.clear()
+    }
+
+    func deleteAccount(password: String, context: ModelContext) async throws {
+        guard !isDeletingAccount, let user = currentUser, !password.isEmpty else {
+            throw APIClientError.server("请先登录并输入当前账号密码")
+        }
+        isDeletingAccount = true
+        defer { isDeletingAccount = false }
+        let response = try await APIClient.shared.deleteAccount(userID: user.id, password: password, token: user.token)
+        guard response.success else { throw APIClientError.server("注销未完成，请重试") }
+        // A switched account must never be signed out or have its data removed.
+        guard currentUser?.id == user.id, currentUser?.token == user.token else { return }
+        signOut()
+        NotificationPreview.syncPreferences(userId: nil, hidden: true)
+        var cleanupFailed = false
+        do {
+            let chats = try context.fetch(FetchDescriptor<Chat>()).filter { $0.memberIds.contains(user.id) }
+            let chatIDs = Set(chats.map(\.chatId))
+            let messages = try context.fetch(FetchDescriptor<Message>()).filter {
+                chatIDs.contains($0.chatId) || $0.senderId == user.id
+            }
+            await EncryptedMediaStore.shared.remove(owner: user.id, messageIDs: messages.map(\.messageId))
+            for message in messages { context.delete(message) }
+            for chat in chats { context.delete(chat) }
+            for profile in try context.fetch(FetchDescriptor<User>()) where profile.userId == user.id {
+                context.delete(profile)
+            }
+            try context.save()
+        } catch { cleanupFailed = true }
+        do { try await E2EEManager.shared.removeAccountKeys(userId: user.id) }
+        catch { cleanupFailed = true }
+        do { try await MLSGroupManager.shared.removeAccount(userId: user.id) }
+        catch { cleanupFailed = true }
+        for service in [NotificationPreview.service] {
+            var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service, kSecAttrAccount as String: user.id]
+            if service == NotificationPreview.service { query[kSecAttrAccessGroup as String] = NotificationPreview.group }
+            let status = SecItemDelete(query as CFDictionary)
+            if status != errSecSuccess && status != errSecItemNotFound { cleanupFailed = true }
+        }
+        AvatarStore.removeAccountAvatar(userId: user.id)
+        accountDeletionNotice = "账号已永久注销，已退出登录。" +
+            (response.mediaCleanupPending == true ? "媒体原文件正在后台清理。" : "") +
+            (cleanupFailed ? "部分本机缓存清理失败，可在系统设置中删除 App 清理。" : "")
+        showAccountDeletionNotice = true
     }
 
     private func restoreSession() {
@@ -228,6 +280,7 @@ final class AuthSession: ObservableObject {
         AuthTokenStore.shared.save(token: user.token)
         userDefaults.removeObject(forKey: tokenKey)
         userDefaults.set(user.id, forKey: "current_user_id")
+        userDefaults.set(user.account, forKey: "current_user_account")
         userDefaults.set(user.nickname, forKey: "current_user_name")
         userDefaults.set(user.avatar, forKey: "current_user_avatar")
         var persistedUser = user
@@ -241,7 +294,9 @@ final class AuthSession: ObservableObject {
 final class AuthTokenStore {
     static let shared = AuthTokenStore()
 
-    private let service = "chat.imim.auth"
+    // Scope authentication to the production API host so credentials from a
+    // retired host cannot silently restore a session here.
+    private let service = AppServer.authKeychainService
     private let account = "bearer-token"
 
     private init() {

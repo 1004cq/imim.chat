@@ -3,6 +3,7 @@ import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
 import Kingfisher
+import AVKit
 
 struct ChatDetailView: View {
     @Environment(\.modelContext) private var modelContext
@@ -19,8 +20,8 @@ struct ChatDetailView: View {
     @State private var isPhotoPickerPresented = false
     @State private var photoPickerFilter: PHPickerFilter = .any(of: [.images, .videos])
     @State private var isFileImporterPresented = false
-    @State private var lastVisibleMessageId: String?
-    @State private var didRestoreScrollPosition = false
+    @State private var didPerformInitialScroll = false
+    @State private var isNearMessageBottom = true
     @State private var isShowingMediaPanel = false
     @State private var isShowingVanishDurationPicker = false
     @State private var composerInsertion: ComposerInsertion?
@@ -81,14 +82,15 @@ struct ChatDetailView: View {
             isConversationLocked = ConversationPreferences.hasPasscode(for: chat.chatId)
             NotificationRouter.shared.setActiveConversation(chat.chatId)
             PushNotificationManager.shared.updatePresence(.foreground, activeChatId: chat.chatId)
+            if chat.type == "group" { SocketManager.shared.joinGroup(chat.chatId) }
             viewModel.markAsRead(chat, modelContext: modelContext)
         }
         .onDisappear {
+            if chat.type == "group" { SocketManager.shared.leaveGroup(chat.chatId) }
             if NotificationRouter.shared.activeConversationId == chat.chatId {
                 NotificationRouter.shared.setActiveConversation(nil)
                 PushNotificationManager.shared.updatePresence(.foreground)
             }
-            ConversationScrollPositionStore.save(lastVisibleMessageId, for: chat.chatId)
         }
         .task {
             await viewModel.loadMessages(for: chat, modelContext: modelContext)
@@ -153,7 +155,7 @@ struct ChatDetailView: View {
         )) {
             Button("好", role: .cancel) {}
         } message: {
-            Text(callPresentationError ?? "")
+            AppLocalizedText(callPresentationError ?? "")
         }
         .confirmationDialog("消失模式", isPresented: $isShowingVanishDurationPicker, titleVisibility: .visible) {
             Button("5 秒") { setVanishMode(seconds: 5) }
@@ -182,7 +184,7 @@ struct ChatDetailView: View {
 
                 HStack(spacing: 4) {
                     PresenceDot(isOnline: socket.isConnected)
-                    Text(chat.type == "group" ? "\(max(chat.memberIds.count, 4)) 位成员" : (socket.isConnected ? "实时连接" : "等待重连"))
+                    Text(chat.type == "group" ? AppLocalization.text("\(max(chat.memberIds.count, 4)) 位成员") : (socket.isConnected ? AppLocalization.text("实时连接") : AppLocalization.text("等待重连")))
                     if chat.vanishMode {
                         Text("消失模式")
                             .font(.system(size: 10, weight: .semibold))
@@ -261,97 +263,127 @@ struct ChatDetailView: View {
         // this render pass: calling it again from every row previously repeated
         // the sort while an incoming message was being inserted.
         let messageItems = messages
-        return ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(Array(messageItems.enumerated()), id: \.element.messageId) { index, message in
-                        if shouldShowTimeGroup(message, previous: index > 0 ? messageItems[index - 1] : nil) {
-                            Text(message.createdAt.chatTimeGroupText)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(DoveTheme.warmGray.opacity(0.62), in: Capsule())
-                                .padding(.vertical, 4)
+        return GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    // The API returns at most 50 messages. A regular VStack keeps
+                    // every row's measured height stable while media and status
+                    // views update. LazyVStack's estimated heights caused visible
+                    // jumps and large blank gaps during interactive scrolling.
+                    VStack(spacing: 2) {
+                        ForEach(Array(messageItems.enumerated()), id: \.element.messageId) { index, message in
+                            if shouldShowTimeGroup(message, previous: index > 0 ? messageItems[index - 1] : nil) {
+                                AppLocalizedText(message.createdAt.chatTimeGroupText)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(DoveTheme.warmGray.opacity(0.62), in: Capsule())
+                                    .padding(.vertical, 4)
+                            }
+
+                            MessageBubble(
+                                message: message,
+                                peerName: chat.name,
+                                peerAvatar: chat.avatar,
+                                peerUserId: chat.avatarPeerUserId,
+                                isForwardingRestricted: chat.restrictForwarding || message.forwardRestricted,
+                                voiceRecorder: voiceRecorder,
+                                onReply: {
+                                    dismissInputSurfaces()
+                                    viewModel.beginReply(to: message)
+                                    isInputFocused = true
+                                },
+                                onMention: {
+                                    dismissInputSurfaces()
+                                    composerInsertion = ComposerInsertion(text: "@\(chat.name) ")
+                                    isInputFocused = true
+                                },
+                                onRecall: {
+                                    Task {
+                                        await viewModel.recall(message, in: chat, modelContext: modelContext)
+                                    }
+                                },
+                                onRetry: {
+                                    Task { await viewModel.recoverEncryptionSession(for: chat, modelContext: modelContext) }
+                                },
+                                onMediaRetry: {
+                                    Task { await viewModel.retryMedia(message, modelContext: modelContext) }
+                                }
+                            )
+                            .id(message.messageId)
                         }
 
-                        MessageBubble(
-                            message: message,
-                            peerName: chat.name,
-                            peerAvatar: chat.avatar,
-                            isForwardingRestricted: chat.restrictForwarding || message.forwardRestricted,
-                            voiceRecorder: voiceRecorder,
-                            onReply: {
-                                viewModel.beginReply(to: message)
-                                isInputFocused = true
-                            },
-                            onMention: {
-                                composerInsertion = ComposerInsertion(text: "@\(chat.name) ")
-                                isInputFocused = true
-                            },
-                            onRecall: {
-                                Task {
-                                    await viewModel.recall(message, in: chat, modelContext: modelContext)
-                                }
-                            },
-                            onRetry: {
-                                Task { await viewModel.recoverEncryptionSession(for: chat, modelContext: modelContext) }
-                            }
-                        )
-                            .id(message.messageId)
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.messageBottomAnchorId)
                             .background {
                                 GeometryReader { geometry in
                                     Color.clear.preference(
-                                        key: MessageViewportPreferenceKey.self,
-                                        value: [message.messageId: geometry.frame(in: .named("chatMessages")).minY]
+                                        key: MessageBottomPreferenceKey.self,
+                                        value: geometry.frame(in: .named("chatMessages")).maxY
                                     )
                                 }
                             }
                     }
+                    .padding(.horizontal, 0)
+                    .padding(.top, 12)
+                    .padding(.bottom, 18)
                 }
-                .padding(.horizontal, 0)
-                .padding(.top, 12)
-                .padding(.bottom, 18)
-            }
-            .coordinateSpace(name: "chatMessages")
-            .scrollDismissesKeyboard(.interactively)
-            .onAppear {
-                restoreScrollPositionIfNeeded(proxy: proxy, messageItems: messageItems)
-            }
-            .onChange(of: messageItems.last?.messageId) { _, _ in
-                guard didRestoreScrollPosition, !viewModel.isLoadingMessages else { return }
-                scheduleScrollToBottom(proxy: proxy, animated: true)
-            }
-            .onChange(of: viewModel.isLoadingMessages) { _, isLoading in
-                guard !isLoading else { return }
-                restoreScrollPositionIfNeeded(proxy: proxy, messageItems: messageItems)
-            }
-            .onPreferenceChange(MessageViewportPreferenceKey.self) { positions in
-                guard let visible = positions
-                    .filter({ $0.value >= 0 })
-                    .min(by: { $0.value < $1.value })?
-                    .key else { return }
-                lastVisibleMessageId = visible
+                .coordinateSpace(name: "chatMessages")
+                .contentShape(Rectangle())
+                .simultaneousGesture(
+                    TapGesture().onEnded {
+                        dismissInputSurfaces()
+                    }
+                )
+                .scrollDismissesKeyboard(.interactively)
+                .onAppear {
+                    performInitialScrollIfNeeded(proxy: proxy, messageItems: messageItems)
+                }
+                .onChange(of: messageItems.last?.messageId) { oldValue, newValue in
+                    guard didPerformInitialScroll,
+                          !viewModel.isLoadingMessages,
+                          oldValue != newValue,
+                          oldValue.map({ oldId in
+                              messageItems.contains(where: { $0.messageId == oldId })
+                          }) == true,
+                          let lastMessage = messageItems.last,
+                          lastMessage.isOutgoing || isNearMessageBottom else { return }
+                    scheduleScrollToBottom(proxy: proxy, animated: true)
+                }
+                .onChange(of: viewModel.isLoadingMessages) { _, isLoading in
+                    guard !isLoading else { return }
+                    if didPerformInitialScroll {
+                        if isNearMessageBottom {
+                            scheduleScrollToBottom(proxy: proxy, animated: false)
+                        }
+                    } else {
+                        performInitialScrollIfNeeded(proxy: proxy, messageItems: messageItems)
+                    }
+                }
+                .onPreferenceChange(MessageBottomPreferenceKey.self) { bottomY in
+                    guard bottomY.isFinite else { return }
+                    let nearBottom = bottomY <= viewport.size.height + 100
+                    if nearBottom != isNearMessageBottom {
+                        isNearMessageBottom = nearBottom
+                    }
+                }
             }
         }
     }
 
-    private func restoreScrollPositionIfNeeded(proxy: ScrollViewProxy, messageItems: [Message]) {
-        guard !didRestoreScrollPosition, !messageItems.isEmpty else { return }
-        didRestoreScrollPosition = true
-
-        let savedMessageId = ConversationScrollPositionStore.load(for: chat.chatId)
-        let targetMessageId = messageItems.contains(where: { $0.messageId == savedMessageId })
-            ? savedMessageId
-            : messageItems.last?.messageId
-
-        guard let targetMessageId else { return }
+    private func performInitialScrollIfNeeded(proxy: ScrollViewProxy, messageItems: [Message]) {
+        guard !didPerformInitialScroll, !messageItems.isEmpty else { return }
+        didPerformInitialScroll = true
         DispatchQueue.main.async {
             withAnimation(nil) {
-                proxy.scrollTo(targetMessageId, anchor: savedMessageId == targetMessageId ? .top : .bottom)
+                proxy.scrollTo(Self.messageBottomAnchorId, anchor: .bottom)
             }
         }
     }
+
+    private static let messageBottomAnchorId = "chat-message-bottom-anchor"
 
     private var inputBar: some View {
         VStack(spacing: 8) {
@@ -414,6 +446,8 @@ struct ChatDetailView: View {
                     Task {
                         await viewModel.sendSticker(sticker, from: pack, in: chat, modelContext: modelContext)
                     }
+                } onDismiss: {
+                    dismissInputSurfaces()
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -433,7 +467,7 @@ struct ChatDetailView: View {
         )) {
             Button("好", role: .cancel) {}
         } message: {
-            Text(voiceRecorder.errorMessage ?? "")
+            AppLocalizedText(voiceRecorder.errorMessage ?? "")
         }
         .photosPicker(isPresented: $isPhotoPickerPresented, selection: $selectedPhotoItem, matching: photoPickerFilter)
         .fileImporter(
@@ -488,7 +522,7 @@ struct ChatDetailView: View {
                     }
                     AttachmentAction(
                         icon: chat.vanishMode ? "timer.circle.fill" : "timer",
-                        title: chat.vanishMode ? "消失模式 · \(vanishDurationLabel)" : "消失模式",
+                        title: chat.vanishMode ? AppLocalization.text("消失模式 · \(vanishDurationLabel)") : AppLocalization.string("消失模式"),
                         isSelected: chat.vanishMode
                     ) {
                         isShowingVanishDurationPicker = true
@@ -515,7 +549,7 @@ struct ChatDetailView: View {
                 .clipShape(Capsule())
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("回复 \(message.isOutgoing ? "我" : chat.name)")
+                Text("回复 \(message.isOutgoing ? AppLocalization.string("我") : chat.name)")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DoveTheme.green)
                 Text(message.content)
@@ -553,7 +587,7 @@ struct ChatDetailView: View {
             .padding(.vertical, 6)
             .background(.thinMaterial)
         } else if let noticeMessage = viewModel.noticeMessage {
-            Text(noticeMessage)
+            AppLocalizedText(noticeMessage)
                 .font(.caption)
                 .foregroundStyle(.green)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -561,7 +595,7 @@ struct ChatDetailView: View {
                 .padding(.vertical, 6)
                 .background(.thinMaterial)
         } else if let errorMessage = viewModel.errorMessage {
-            Text(errorMessage)
+            AppLocalizedText(errorMessage)
                 .font(.caption)
                 .foregroundStyle(.red)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -576,7 +610,7 @@ struct ChatDetailView: View {
         case 5: return "5 秒"
         case 10: return "10 秒"
         case 86_400: return "24 小时"
-        case let seconds?: return "\(seconds) 秒"
+        case let seconds?: return AppLocalization.text("\(seconds) 秒")
         default: return "已开启"
         }
     }
@@ -593,25 +627,32 @@ struct ChatDetailView: View {
         }
     }
 
+    private func dismissInputSurfaces() {
+        isInputFocused = false
+        withAnimation(.easeOut(duration: 0.18)) {
+            isShowingMediaPanel = false
+            viewModel.isShowingAttachmentPanel = false
+        }
+    }
+
     private func shouldShowTimeGroup(_ current: Message, previous: Message?) -> Bool {
         guard let previous else { return true }
         return current.createdAt.timeIntervalSince(previous.createdAt) > 300
     }
 
     private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-        guard let lastId = messages.last?.messageId else { return }
         if animated {
             withAnimation(.easeOut(duration: 0.25)) {
-                proxy.scrollTo(lastId, anchor: .bottom)
+                proxy.scrollTo(Self.messageBottomAnchorId, anchor: .bottom)
             }
         } else {
-            proxy.scrollTo(lastId, anchor: .bottom)
+            proxy.scrollTo(Self.messageBottomAnchorId, anchor: .bottom)
         }
     }
 
     private func scheduleScrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-        // LazyVStack lays out asynchronously after remote history is merged.
-        // Deferring one run-loop turn makes the newest message a valid scroll target.
+        // Defer one run-loop turn so the bottom anchor reflects the newly
+        // inserted message before changing the scroll position.
         DispatchQueue.main.async {
             scrollToBottom(proxy: proxy, animated: animated)
         }
@@ -728,6 +769,7 @@ private struct ChatTextComposer: View {
     var body: some View {
         HStack(alignment: .center, spacing: 9) {
             Button {
+                isInputFocused = false
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                     isShowingMediaPanel = false
                     isShowingAttachmentPanel.toggle()
@@ -749,7 +791,10 @@ private struct ChatTextComposer: View {
                     .submitLabel(.send)
                     .frame(height: 40)
                     .onTapGesture {
-                        isShowingMediaPanel = false
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            isShowingMediaPanel = false
+                            isShowingAttachmentPanel = false
+                        }
                     }
                     .onSubmit {
                         submit()
@@ -762,12 +807,13 @@ private struct ChatTextComposer: View {
                         isShowingMediaPanel.toggle()
                     }
                 } label: {
-                    Image(systemName: "face.smiling")
+                    Image(systemName: isShowingMediaPanel ? "keyboard.chevron.compact.down" : "face.smiling")
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(.secondary)
                         .frame(width: 28, height: 40)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(isShowingMediaPanel ? AppLocalization.text("关闭表情贴纸") : AppLocalization.text("打开表情贴纸"))
             }
             .padding(.leading, 12)
             .padding(.trailing, 6)
@@ -841,7 +887,7 @@ private struct AttachmentAction: View {
                     .background(isSelected ? DoveTheme.green : DoveTheme.cardSurface.opacity(0.84), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(DoveTheme.green.opacity(isSelected ? 0 : 0.35), lineWidth: 1))
 
-                Text(title)
+                AppLocalizedText(title)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(isSelected ? DoveTheme.green : .secondary)
                     .lineLimit(1)
@@ -893,7 +939,7 @@ private struct EmojiPickerPanel: View {
                                 category = item
                             }
                         } label: {
-                            Text(item.rawValue)
+                            AppLocalizedText(item.rawValue)
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(category == item ? Color.white : DoveTheme.ink)
                                 .padding(.horizontal, 12)
@@ -941,21 +987,25 @@ private struct MessageBubble: View {
     let message: Message
     let peerName: String
     let peerAvatar: String?
+    let peerUserId: String?
     let isForwardingRestricted: Bool
     @ObservedObject var voiceRecorder: VoiceRecorderManager
     let onReply: () -> Void
     let onMention: () -> Void
     let onRecall: () -> Void
     let onRetry: () -> Void
+    let onMediaRetry: () -> Void
     @AppStorage("chatTextScale") private var chatTextScale = 1.0
     @State private var imageRetryToken = UUID()
+    @State private var videoPlayer: AVPlayer?
+    @State private var isShowingVideo = false
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
             if message.isOutgoing {
                 Spacer(minLength: DoveTheme.Chat.avatarSize + 16)
             } else {
-                DoveAvatar(name: peerName, url: peerAvatar, size: DoveTheme.Chat.avatarSize)
+                DoveAvatar(name: peerName, url: peerAvatar, userId: peerUserId, size: DoveTheme.Chat.avatarSize)
                     .padding(.top, 4)
             }
 
@@ -1004,7 +1054,7 @@ private struct MessageBubble: View {
             .frame(maxWidth: UIScreen.main.bounds.width * 0.70, alignment: message.isOutgoing ? .trailing : .leading)
 
             if message.isOutgoing {
-                DoveAvatar(name: "我", size: DoveTheme.Chat.avatarSize)
+                DoveAvatar(name: AppLocalization.string("我"), size: DoveTheme.Chat.avatarSize)
                     .padding(.top, 4)
             } else {
                 Spacer(minLength: DoveTheme.Chat.avatarSize + 16)
@@ -1012,6 +1062,20 @@ private struct MessageBubble: View {
         }
         .padding(.horizontal, DoveTheme.Chat.horizontalPadding)
         .padding(.vertical, 3)
+        .sheet(isPresented: $isShowingVideo, onDismiss: {
+            videoPlayer?.pause()
+            videoPlayer = nil
+        }) {
+            NavigationStack {
+                VideoPlayer(player: videoPlayer)
+                    .onAppear { videoPlayer?.play() }
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("关闭") { isShowingVideo = false }
+                        }
+                    }
+            }
+        }
     }
 
     private var bubbleContent: some View {
@@ -1022,7 +1086,9 @@ private struct MessageBubble: View {
                     isPlaying: voiceRecorder.playingMessageId == message.messageId && voiceRecorder.isPlaying,
                     progress: voiceRecorder.playingMessageId == message.messageId ? voiceRecorder.playbackProgress : 0
                 ) {
-                    voiceRecorder.togglePlayback(messageId: message.messageId, urlString: message.voiceURL)
+                    if let url = CQIMMediaURL.resolve(message.voiceURL), url.isFileURL {
+                        voiceRecorder.togglePlayback(messageId: message.messageId, urlString: url.absoluteString)
+                    } else { onMediaRetry() }
                 }
             } else if message.type == "sticker" || message.type == "gif" || message.type == "meme" {
                 stickerBubble
@@ -1030,7 +1096,15 @@ private struct MessageBubble: View {
                 stickerBubble
             } else if message.type == "image" {
                 imageBubble
-            } else if message.type == "video" || message.type == "file" {
+            } else if message.type == "video" {
+                Button {
+                    if let url = CQIMMediaURL.resolve(message.mediaURL), url.isFileURL {
+                        videoPlayer = AVPlayer(url: url)
+                        isShowingVideo = true
+                    } else { onMediaRetry() }
+                } label: { fileBubble }
+                .buttonStyle(.plain)
+            } else if message.type == "file" {
                 fileBubble
             } else {
                 textBubble
@@ -1074,17 +1148,18 @@ private struct MessageBubble: View {
 
     private var imageBubble: some View {
         Group {
-            if let url = CQIMMediaURL.resolve(message.mediaURL) {
+            if let url = CQIMMediaURL.resolve(message.mediaURL), url.isFileURL {
                 AuthenticatedRemoteImage(url: url, contentMode: .fill) {
                     unavailableMediaView(title: "图片加载失败，点按重试", icon: "photo") {
                         imageRetryToken = UUID()
+                        onMediaRetry()
                     }
                 }
                 .id(imageRetryToken)
                 .frame(width: 190, height: 140)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             } else {
-                unavailableMediaView(title: message.status == "sending" ? "正在发送图片..." : "图片不可用", icon: "photo") {}
+                unavailableMediaView(title: message.status == "sending" ? "正在发送图片..." : "图片未加载，点按重试", icon: "photo", retry: onMediaRetry)
             }
         }
         .shadow(color: .black.opacity(0.04), radius: 8, y: 3)
@@ -1144,7 +1219,7 @@ private struct MessageBubble: View {
             VStack(spacing: 8) {
                 Image(systemName: icon)
                     .font(.title2)
-                Text(title)
+                AppLocalizedText(title)
                     .font(.caption)
             }
             .foregroundStyle(.secondary)
@@ -1229,7 +1304,7 @@ private struct HeaderIconButton: View {
 @MainActor
 private struct AuthenticatedRemoteImage<Failure: View>: View {
     let url: URL
-    var contentMode: ContentMode = .fill
+    var contentMode: SwiftUI.ContentMode = .fill
     @ViewBuilder var failure: () -> Failure
 
     @State private var image: UIImage?
@@ -1304,38 +1379,21 @@ private struct PresenceDot: View {
 private extension Date {
     var chatTimeGroupText: String {
         let calendar = Calendar.current
-        let time = formatted(date: .omitted, time: .shortened)
+        let time = formatted(.dateTime.hour().minute().locale(AppLanguage.current.locale))
         if calendar.isDateInToday(self) {
-            return "今天 \(time)"
+            return AppLocalization.text("今天 \(time)")
         }
         if calendar.isDateInYesterday(self) {
-            return "昨天 \(time)"
+            return AppLocalization.text("昨天 \(time)")
         }
-        return formatted(.dateTime.month().day().hour().minute())
+        return formatted(.dateTime.month().day().hour().minute().locale(AppLanguage.current.locale))
     }
 }
 
-private enum ConversationScrollPositionStore {
-    private static let keyPrefix = "chat_last_visible_message_"
+private struct MessageBottomPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = .infinity
 
-    static func load(for chatId: String) -> String? {
-        UserDefaults.standard.string(forKey: keyPrefix + chatId)
-    }
-
-    static func save(_ messageId: String?, for chatId: String) {
-        let key = keyPrefix + chatId
-        if let messageId, !messageId.isEmpty {
-            UserDefaults.standard.set(messageId, forKey: key)
-        } else {
-            UserDefaults.standard.removeObject(forKey: key)
-        }
-    }
-}
-
-private struct MessageViewportPreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGFloat] = [:]
-
-    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }

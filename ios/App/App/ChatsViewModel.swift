@@ -36,6 +36,15 @@ struct ChatConversationModel: Identifiable, Equatable {
     }
 }
 
+/// Transient row input, not another persistence/cache layer. Keep the action
+/// target beside its display value so lazy rows never search the entire query.
+struct ChatConversationRow: Identifiable {
+    let chat: Chat
+    let conversation: ChatConversationModel
+
+    var id: String { conversation.id }
+}
+
 @MainActor
 final class IMConversationViewModel: ObservableObject {
     enum Filter: String, CaseIterable {
@@ -48,8 +57,10 @@ final class IMConversationViewModel: ObservableObject {
     @Published var isRefreshing = false
     @Published var errorMessage: String?
 
-    func conversations(from chats: [Chat]) -> [ChatConversationModel] {
-        filteredChats(from: chats).map { ChatConversationModel(chat: $0, subtitle: displaySubtitle(for: $0)) }
+    func conversationRows(from chats: [Chat]) -> [ChatConversationRow] {
+        filteredChats(from: chats).map { chat in
+            ChatConversationRow(chat: chat, conversation: ChatConversationModel(chat: chat, subtitle: displaySubtitle(for: chat)))
+        }
     }
 
     func filteredChats(from chats: [Chat]) -> [Chat] {
@@ -81,6 +92,7 @@ final class IMConversationViewModel: ObservableObject {
     }
 
     func togglePinned(_ chat: Chat, modelContext: ModelContext) {
+        guard !chat.isBuiltinSystemConversation else { return }
         chat.isPinned.toggle()
         try? modelContext.save()
     }
@@ -94,28 +106,33 @@ final class IMConversationViewModel: ObservableObject {
     func displaySubtitle(for chat: Chat) -> String {
         let content = chat.lastMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         if content.isEmpty {
-            return "还没有消息"
+            return AppLocalization.string("还没有消息")
         }
         if content == "[加密消息]" || content == "🔒 [加密消息]" || content == "🔒 加密消息" || content.contains("等待密钥同步") {
-            return "加密消息"
+            return AppLocalization.string("加密消息")
         }
         if content.contains("voice") || content.contains("语音") {
-            return "语音"
+            return AppLocalization.string("语音")
         }
         if content.contains("sticker") || content.contains("贴纸") {
-            return "贴纸"
+            return AppLocalization.string("贴纸")
         }
         if content.contains("image") || content.contains("图片") {
-            return "图片"
+            return AppLocalization.string("图片")
         }
         if content.contains("file") || content.contains("文件") {
-            return "文件"
+            return AppLocalization.string("文件")
         }
         return content
     }
 
     func refresh(chats: [Chat], modelContext: ModelContext) async {
         ensureBuiltinConversations(in: chats, modelContext: modelContext)
+        // SwiftData paints first; no awaiting disk IO or network downloads here.
+        AvatarImageLoader.shared.prefetch(chats.map {
+            .init(userId: $0.avatarPeerUserId, urlString: $0.avatar)
+        } + [.init(userId: UserDefaults.standard.string(forKey: "current_user_id"),
+                   urlString: UserDefaults.standard.string(forKey: "current_user_avatar"))])
         if AuthTokenStore.shared.token == nil {
             return
         }
@@ -124,15 +141,32 @@ final class IMConversationViewModel: ObservableObject {
         errorMessage = nil
         defer { isRefreshing = false }
 
+        var refreshErrors: [String] = []
+
         do {
             let remoteChats = try await APIClient.shared.fetchChats()
             merge(remoteChats: remoteChats, into: chats, modelContext: modelContext)
         } catch {
-            errorMessage = error.localizedDescription
+            refreshErrors.append("私聊：\(error.localizedDescription)")
         }
+
+        if let currentUserId = UserDefaults.standard.string(forKey: "current_user_id"),
+           !currentUserId.isEmpty {
+            do {
+                let remoteGroups = try await APIClient.shared.fetchGroups(userId: currentUserId)
+                merge(remoteGroups: remoteGroups, into: chats, modelContext: modelContext)
+            } catch {
+                refreshErrors.append("群聊：\(error.localizedDescription)")
+            }
+        } else {
+            refreshErrors.append("群聊：缺少当前用户 ID")
+        }
+
+        errorMessage = refreshErrors.isEmpty ? nil : refreshErrors.joined(separator: "；")
     }
 
     func delete(_ chat: Chat, modelContext: ModelContext) {
+        guard !chat.isBuiltinSystemConversation else { return }
         modelContext.delete(chat)
         try? modelContext.save()
     }
@@ -143,6 +177,10 @@ final class IMConversationViewModel: ObservableObject {
         var didChange = false
         for (index, sample) in SampleChatData.builtinConversations.enumerated() {
             if let existing = chats.first(where: { $0.chatId == sample.id }) {
+                if existing.avatar != sample.avatar {
+                    existing.avatar = sample.avatar
+                    didChange = true
+                }
                 if sample.isOfficial && !existing.isOfficial {
                     existing.isOfficial = true
                     didChange = true
@@ -161,6 +199,7 @@ final class IMConversationViewModel: ObservableObject {
             let chat = Chat(
                 chatId: sample.id,
                 name: sample.name,
+                avatar: sample.avatar,
                 type: sample.isGroup ? "group" : "private",
                 unreadCount: sample.unreadCount,
                 lastMessage: sample.lastMessage,
@@ -209,6 +248,63 @@ final class IMConversationViewModel: ObservableObject {
         }
 
         try? modelContext.save()
+        AvatarImageLoader.shared.prefetch(remoteChats.map { remote in
+            let peerId = currentUserId.flatMap { current in
+                [remote.participantA, remote.participantB].first { !$0.isEmpty && $0 != current && $0 != "me" }
+            }
+            return .init(userId: peerId, urlString: remote.peer?.avatar)
+        })
+    }
+
+    func merge(remoteGroups: [RemoteGroup], into localChats: [Chat], modelContext: ModelContext) {
+        let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
+
+        for remoteGroup in remoteGroups {
+            guard let groupId = remoteGroup.resolvedId else { continue }
+            let normalizedName = remoteGroup.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let existing = localChats.first {
+                $0.chatId == groupId || $0.chatId == "group_\(groupId)"
+            }
+            let timestamp = remoteGroup.updatedAt ?? remoteGroup.createdAt
+
+            if let existing {
+                if let normalizedName, !normalizedName.isEmpty {
+                    existing.name = normalizedName
+                }
+                if let avatar = remoteGroup.avatar {
+                    existing.avatar = avatar
+                }
+                existing.type = "group"
+                existing.unreadCount = remoteGroup.unreadCount ?? existing.unreadCount
+                if let lastMessage = remoteGroup.lastMessage, !lastMessage.isEmpty {
+                    existing.lastMessage = lastMessage
+                }
+                if let timestamp {
+                    existing.updatedAt = Date(milliseconds: timestamp)
+                }
+                existing.isEncrypted = true
+                if let currentUserId, !existing.memberIds.contains(currentUserId) {
+                    existing.memberIds.append(currentUserId)
+                }
+            } else {
+                modelContext.insert(Chat(
+                    chatId: groupId,
+                    name: normalizedName.flatMap { $0.isEmpty ? nil : $0 } ?? "未命名群聊",
+                    avatar: remoteGroup.avatar,
+                    type: "group",
+                    unreadCount: remoteGroup.unreadCount ?? 0,
+                    lastMessage: remoteGroup.lastMessage ?? "",
+                    updatedAt: timestamp.map { Date(milliseconds: $0) } ?? Date(),
+                    isEncrypted: true,
+                    memberIds: currentUserId.map { [$0] } ?? []
+                ))
+            }
+        }
+
+        try? modelContext.save()
+        AvatarImageLoader.shared.prefetch(remoteGroups.map {
+            .init(userId: nil, urlString: $0.avatar)
+        })
     }
 
     /// WebSocket 到达新消息时立即更新列表，不等待下一次完整网络刷新。
@@ -246,10 +342,17 @@ final class IMConversationViewModel: ObservableObject {
 
 typealias ChatsViewModel = IMConversationViewModel
 
+extension Chat {
+    var isBuiltinSystemConversation: Bool {
+        chatId == "official" || chatId == "bot"
+    }
+}
+
 private enum SampleChatData {
     struct Conversation {
         let id: String
         let name: String
+        let avatar: String
         let lastMessage: String
         let unreadCount: Int
         let isGroup: Bool
@@ -262,7 +365,7 @@ private enum SampleChatData {
     }
 
     static let builtinConversations = [
-        Conversation(id: "official", name: "imim 官方", lastMessage: "欢迎使用 imim！点击查看新手指南 →", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: true, isBot: false),
-        Conversation(id: "bot", name: "imim AI", lastMessage: "你好，我是 imim AI，请直接告诉我你的问题。", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: false, isBot: true),
+        Conversation(id: "official", name: "imim 官方", avatar: "asset://ImimOfficialAvatar", lastMessage: "欢迎使用 imim！点击查看新手指南 →", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: true, isBot: false),
+        Conversation(id: "bot", name: "imim AI", avatar: "asset://ImimAIAvatar", lastMessage: "你好，我是 imim AI，请直接告诉我你的问题。", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: false, isBot: true),
     ]
 }

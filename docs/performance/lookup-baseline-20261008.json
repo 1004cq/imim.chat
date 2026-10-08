@@ -1,0 +1,72 @@
+{
+  "actual_chat_list_time_format_500_dates_median_ms" : 27.59783333333333,
+  "kind" : "synthetic_mac_microbenchmark_not_device_ui",
+  "lookup" : [
+    {
+      "candidate_index_including_build_median_ms" : 0.0138604,
+      "count" : 100,
+      "current_scan_median_ms" : 0.011381250000000001,
+      "linear_comparisons" : 5050,
+      "lookup_count" : 100,
+      "scenario" : "full_traversal"
+    },
+    {
+      "candidate_index_including_build_median_ms" : 0.0057875000000000001,
+      "count" : 100,
+      "current_scan_median_ms" : 0.0026145999999999999,
+      "linear_comparisons" : 1134,
+      "lookup_count" : 12,
+      "scenario" : "tail_visible_12"
+    },
+    {
+      "candidate_index_including_build_median_ms" : 0.047181250000000001,
+      "count" : 500,
+      "current_scan_median_ms" : 0.34756040000000005,
+      "linear_comparisons" : 125250,
+      "lookup_count" : 500,
+      "scenario" : "full_traversal"
+    },
+    {
+      "candidate_index_including_build_median_ms" : 0.030470799999999999,
+      "count" : 500,
+      "current_scan_median_ms" : 0.01445625,
+      "linear_comparisons" : 5934,
+      "lookup_count" : 12,
+      "scenario" : "tail_visible_12"
+    },
+    {
+      "candidate_index_including_build_median_ms" : 0.083329149999999991,
+      "count" : 1000,
+      "current_scan_median_ms" : 1.0713353999999999,
+      "linear_comparisons" : 500500,
+      "lookup_count" : 1000,
+      "scenario" : "full_traversal"
+    },
+    {
+      "candidate_index_including_build_median_ms" : 0.0543854,
+      "count" : 1000,
+      "current_scan_median_ms" : 0.026604200000000001,
+      "linear_comparisons" : 11934,
+      "lookup_count" : 12,
+      "scenario" : "tail_visible_12"
+    },
+    {
+      "candidate_index_including_build_median_ms" : 0.47848959999999996,
+      "count" : 5000,
+      "current_scan_median_ms" : 26.608870850000002,
+      "linear_comparisons" : 12502500,
+      "lookup_count" : 5000,
+      "scenario" : "full_traversal"
+    },
+    {
+      "candidate_index_including_build_median_ms" : 0.31119795,
+      "count" : 5000,
+      "current_scan_median_ms" : 0.12376664999999999,
+      "linear_comparisons" : 59934,
+      "lookup_count" : 12,
+      "scenario" : "tail_visible_12"
+    }
+  ],
+  "semantics_check" : "duplicate IDs retain first match; missing IDs agree",
+  "timestamp" : "2026-10-08T12:32:25Z"
+}

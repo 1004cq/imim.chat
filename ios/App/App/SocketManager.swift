@@ -9,7 +9,7 @@ class SocketManager: NSObject, ObservableObject {
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var url: URL {
-        var components = URLComponents(string: "wss://wed.imim.chat/signal")!
+        var components = URLComponents(string: AppServer.signalURL)!
         let token = AuthTokenStore.shared.token
         let userId = UserDefaults.standard.string(forKey: "current_user_id") ?? "ios"
         components.queryItems = [
@@ -23,6 +23,7 @@ class SocketManager: NSObject, ObservableObject {
     private var isBackgrounded = false
     private var reconnectEnabled = false
     private var lastEncryptionResetRequest: [String: Date] = [:]
+    private var groupSubscriptions = Set<String>()
 
     private override init() {
         super.init()
@@ -104,6 +105,18 @@ class SocketManager: NSObject, ObservableObject {
                 "messageIds": messageIds
             ]
         ])
+    }
+
+    func joinGroup(_ groupId: String) {
+        guard !groupId.isEmpty else { return }
+        groupSubscriptions.insert(groupId)
+        sendJSON(["type": "group_join", "payload": ["groupId": groupId]])
+    }
+
+    func leaveGroup(_ groupId: String) {
+        guard !groupId.isEmpty else { return }
+        groupSubscriptions.remove(groupId)
+        sendJSON(["type": "group_leave", "payload": ["groupId": groupId]])
     }
 
     func sendRecall(messageId: String, to peerId: String?) {
@@ -189,6 +202,44 @@ class SocketManager: NSObject, ObservableObject {
     private func handleIncomingMessage(_ text: String) {
         guard let data = text.data(using: .utf8) else { return }
 
+        // Group fanout is a top-level payload (unlike private messages, which
+        // are wrapped in `payload`). Decode and decrypt it before the generic
+        // socket envelope so foreground group messages appear immediately.
+        if let groupPush = try? JSONDecoder().decode(SocketGroupMessage.self, from: data),
+           groupPush.type == "group_message" {
+            let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
+            Task { [weak self] in
+                guard let self else { return }
+                let message = await groupPush.remoteMessage.toLocalMessageResolvingMLS(
+                    currentUserId: currentUserId,
+                    groupId: groupPush.groupId
+                )
+                let messageBox = SocketMessageTransferBox(message)
+                await MainActor.run {
+                    let message = messageBox.message
+                    self.lastReceivedMessage = message
+                    NotificationCenter.default.post(
+                        name: .cqimPrivateMessageDidReceive,
+                        object: message,
+                        userInfo: ["ack": false]
+                    )
+                    if NotificationRouter.shared.activeConversationId != message.chatId,
+                       !ConversationPreferences.isMuted(for: message.chatId) {
+                        PushNotificationManager.shared.showRealtimeMessageBanner(
+                            chatId: message.chatId,
+                            title: groupPush.senderName,
+                            body: "你收到一条加密群消息",
+                            avatarURL: groupPush.senderAvatar,
+                            senderId: groupPush.senderId,
+                            messageId: message.messageId,
+                            decryptedPreview: Self.notificationPreview(for: message)
+                        )
+                    }
+                }
+            }
+            return
+        }
+
         if let envelope = try? JSONDecoder().decode(SocketEnvelope.self, from: data) {
             switch envelope.type {
             case "private_message":
@@ -201,6 +252,12 @@ class SocketManager: NSObject, ObservableObject {
                 // web message never stalls typing or scrolling.
                 Task { [weak self] in
                     guard let self else { return }
+                    if !isAck {
+                        let claimed = await MainActor.run {
+                            IncomingMessagePersistence.shared.begin(remoteMessage.id, owner: currentUserId)
+                        }
+                        guard claimed else { return }
+                    }
                     let senderName = remoteMessage.senderName?.trimmingCharacters(in: .whitespacesAndNewlines)
                     let notificationTitle = (senderName?.isEmpty == false ? senderName : nil) ?? "新消息"
                     let message: Message
@@ -212,9 +269,19 @@ class SocketManager: NSObject, ObservableObject {
                         message.status = "sent"
                     } else {
                         message = await remoteMessage.toLocalMessageResolvingEncryption(currentUserId: currentUserId)
+                        // Duplicate, delayed or malformed ciphertext must not
+                        // silently force the peer to discard a healthy ratchet.
                     }
 
+                    // `Message` is a mutable SwiftData model. This box performs a
+                    // one-way handoff to the UI actor; the background task does not
+                    // access the model again after this point.
+                    let messageBox = SocketMessageTransferBox(message)
                     await MainActor.run {
+                        let message = messageBox.message
+                        if !isAck {
+                            guard IncomingMessagePersistence.shared.store(message, owner: currentUserId) != nil else { return }
+                        }
                         self.lastReceivedMessage = message
                         NotificationCenter.default.post(
                             name: .cqimPrivateMessageDidReceive,
@@ -234,7 +301,9 @@ class SocketManager: NSObject, ObservableObject {
                                 title: notificationTitle,
                                 body: remoteMessage.msgType == "encrypted" ? "你收到一条加密消息" : "你收到一条新消息",
                                 avatarURL: remoteMessage.senderAvatar,
-                                messageId: message.messageId
+                                senderId: remoteMessage.senderId,
+                                messageId: message.messageId,
+                                decryptedPreview: Self.notificationPreview(for: message)
                             )
                         }
                     }
@@ -267,11 +336,13 @@ class SocketManager: NSObject, ObservableObject {
                 }
             case "e2ee_session_reset":
                 guard let peerId = envelope.from, !peerId.isEmpty else { return }
-                do {
-                    try E2EEManager.shared.resetSession(with: peerId)
-                    print("[E2EE] peer requested a new session")
-                } catch {
-                    print("[E2EE] unable to reset requested session: \(error.localizedDescription)")
+                Task {
+                    do {
+                        try await E2EEManager.shared.resetSession(with: peerId)
+                        print("[E2EE] peer requested a new session")
+                    } catch {
+                        print("[E2EE] unable to reset requested session: \(error.localizedDescription)")
+                    }
                 }
             case "call_invite":
                 DispatchQueue.main.async {
@@ -359,6 +430,44 @@ class SocketManager: NSObject, ObservableObject {
         }
         reconnectWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: workItem)
+    }
+}
+
+private struct SocketGroupMessage: Decodable {
+    let type: String
+    let groupId: String
+    let seq: Int
+    let senderId: String
+    let senderName: String
+    let senderAvatar: String?
+    let msgType: String
+    let content: String
+    let replyToId: String?
+    let extra: RemoteMessageExtra?
+    let timestamp: Int64
+
+    var remoteMessage: RemoteGroupMessage {
+        RemoteGroupMessage(
+            id: "\(groupId):\(seq)",
+            seq: seq,
+            senderId: senderId,
+            senderName: senderName,
+            senderAvatar: senderAvatar,
+            msgType: msgType,
+            content: content,
+            replyToId: replyToId,
+            extra: extra,
+            createdAt: ISO8601DateFormatter().string(from: Date(milliseconds: timestamp)),
+            isRevoked: false
+        )
+    }
+}
+
+private final class SocketMessageTransferBox: @unchecked Sendable {
+    let message: Message
+
+    init(_ message: Message) {
+        self.message = message
     }
 }
 
@@ -503,7 +612,31 @@ extension Notification.Name {
 }
 
 extension SocketManager: URLSessionWebSocketDelegate {
+    @MainActor
+    private static func notificationPreview(for message: Message) -> String? {
+        guard message.burnAfterRead == nil, !message.content.hasPrefix("🔒") else { return nil }
+        switch message.type {
+        case "image": return "[图片]"
+        case "video": return "[视频]"
+        case "voice", "audio": return "[语音]"
+        case "file": return "[文件]"
+        case "sticker": return "[贴纸]"
+        default:
+            if let data = message.content.data(using: .utf8),
+               let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // MLS may return its structured inner content. Never preview an envelope.
+                guard value["ciphertext"] == nil, value["ct"] == nil,
+                      let text = value["content"] as? String else { return nil }
+                return NotificationPreview.shortText(text)
+            }
+            return NotificationPreview.shortText(message.content)
+        }
+    }
+
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        for groupId in groupSubscriptions {
+            sendJSON(["type": "group_join", "payload": ["groupId": groupId]])
+        }
         DispatchQueue.main.async {
             self.isConnected = true
             print("WebSocket 已连接")

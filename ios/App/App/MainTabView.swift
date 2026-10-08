@@ -1,5 +1,6 @@
 import SwiftData
 import SwiftUI
+import UIKit
 
 struct MainTabView: View {
     @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
@@ -7,6 +8,7 @@ struct MainTabView: View {
     @State private var selectedTab = 0
     @State private var messageNavigationPath = NavigationPath()
     @State private var isCustomTabBarHidden = false
+    @State private var isKeyboardVisible = false
     @AppStorage("notification_private_chats") private var privateChatsNotificationsEnabled = true
     @State private var inAppMessageNotification: InAppMessageNotification?
 
@@ -55,7 +57,7 @@ struct MainTabView: View {
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if !isCustomTabBarHidden {
+                if !isCustomTabBarHidden && !isKeyboardVisible {
                     DoveBottomTabBar(
                         selectedTab: $selectedTab,
                         totalUnread: chats.reduce(0) { $0 + $1.unreadCount }
@@ -67,6 +69,12 @@ struct MainTabView: View {
                 withAnimation(.easeInOut(duration: 0.18)) {
                     isCustomTabBarHidden = hidden
                 }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                isKeyboardVisible = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                isKeyboardVisible = false
             }
 
             if let notification = inAppMessageNotification {
@@ -206,7 +214,12 @@ struct CQIMTabBarHiddenPreferenceKey: PreferenceKey {
 private struct DoveBottomTabBar: View {
     @Binding var selectedTab: Int
     let totalUnread: Int
-    @State private var dragOffset: CGFloat = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.layoutDirection) private var layoutDirection
+    // SwiftUI resets this even when the gesture is cancelled or the bar disappears.
+    @GestureState private var dragLocation: CGFloat?
 
     private let tabs: [(title: String, icon: String, selectedIcon: String)] = [
         ("消息", "bubble.left.and.bubble.right", "bubble.left.and.bubble.right.fill"),
@@ -220,56 +233,54 @@ private struct DoveBottomTabBar: View {
     }
 
     private var decoratedTabBar: some View {
-        Group {
-            if #available(iOS 26.0, *) {
-                GlassEffectContainer(spacing: 10) {
-                    tabBarContent
-                }
-            } else {
-                tabBarContent
-            }
-        }
+        tabBarShell
+            .padding(.horizontal, 18)
+            .padding(.top, 4)
+            .padding(.bottom, 6)
+            .sensoryFeedback(.selection, trigger: selectedTab)
+    }
+
+    private var tabBarShell: some View {
+        tabBarContent
             .padding(6)
-            .background {
-                tabBarSurface
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 6)
-            .padding(.bottom, 4)
+            .background { tabBarSurface }
     }
 
     private var tabBarContent: some View {
         GeometryReader { proxy in
-            let spacing: CGFloat = 2
-            let tabWidth = max(0, (proxy.size.width - spacing * CGFloat(tabs.count - 1)) / CGFloat(tabs.count))
-            let tabStride = tabWidth + spacing
-            let selectedOffset = CGFloat(selectedTab) * tabStride
-            let draggedOffset = min(
-                max(0, selectedOffset + dragOffset),
-                tabStride * CGFloat(tabs.count - 1)
+            let layout = DoveTabBarLayout(
+                width: proxy.size.width,
+                count: tabs.count,
+                isRightToLeft: layoutDirection == .rightToLeft
             )
+            let lensCenter = dragLocation.map { layout.clampedCenter($0) }
+                ?? layout.center(for: selectedTab)
 
             ZStack(alignment: .leading) {
-                selectedTabSurface
-                    .frame(width: tabWidth, height: 58)
-                    .offset(x: draggedOffset)
-                    .animation(dragOffset == 0 ? .spring(response: 0.34, dampingFraction: 0.78, blendDuration: 0.1) : nil, value: selectedTab)
+                // Only the lens participates in glass rendering. Labels and
+                // badges must stay outside its container, above the backdrop.
+                selectionBackdrop
+                    .frame(width: layout.selectionWidth, height: 50)
+                    .scaleEffect(dragLocation != nil && !reduceMotion ? 1.04 : 1)
+                    .position(x: lensCenter, y: 28)
+                    .animation(dragLocation == nil ? selectionAnimation : nil, value: selectedTab)
+                    .animation(selectionAnimation, value: dragLocation == nil)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
 
-                HStack(spacing: spacing) {
+                HStack(spacing: layout.spacing) {
                     ForEach(Array(tabs.enumerated()), id: \.offset) { index, tab in
                         Button {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                            withAnimation(selectionAnimation) {
                                 selectedTab = index
                             }
                         } label: {
                             VStack(spacing: 4) {
                                 ZStack(alignment: .topTrailing) {
                                     Image(systemName: selectedTab == index ? tab.selectedIcon : tab.icon)
-                                        .font(.system(size: 20, weight: selectedTab == index ? .semibold : .regular))
-                                        .symbolRenderingMode(.hierarchical)
-                                        .foregroundStyle(selectedTab == index ? DoveTheme.green : Color.secondary.opacity(0.68))
-                                        .scaleEffect(selectedTab == index ? 1.08 : 1)
-                                        .offset(y: selectedTab == index ? -1 : 0)
+                                        .font(.system(size: 21, weight: selectedTab == index ? .bold : .semibold))
+                                        .symbolRenderingMode(.monochrome)
+                                        .foregroundStyle(selectedTab == index ? selectedForeground : unselectedForeground)
 
                                     if index == 0 {
                                         DoveUnreadBadge(count: totalUnread)
@@ -278,79 +289,185 @@ private struct DoveBottomTabBar: View {
                                 }
                                 .frame(height: 24)
 
-                                Text(tab.title)
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(selectedTab == index ? DoveTheme.green : Color.secondary.opacity(0.55))
-                                    .opacity(selectedTab == index ? 1 : 0.62)
+                                AppLocalizedText(tab.title)
+                                    .font(.system(size: 11, weight: selectedTab == index ? .bold : .semibold))
+                                    .foregroundStyle(selectedTab == index ? selectedForeground : unselectedForeground)
                             }
-                            .frame(maxWidth: .infinity, minHeight: 58)
+                            .frame(maxWidth: .infinity, minHeight: 56)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("bottom-tab-\(index)")
+                        .accessibilityLabel(LocalizedStringKey(tab.title))
+                        .accessibilityValue(selectedTab == index ? "已选择" : "")
+                        .accessibilityAddTraits(selectedTab == index ? .isSelected : [])
                     }
                 }
             }
             .contentShape(Rectangle())
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 8)
+            // A recognized scrub wins over the original button's tap and the
+            // page-style TabView pan, so release cannot jump back to the start tab.
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 6, coordinateSpace: .local)
+                    .updating($dragLocation) { value, location, transaction in
+                        transaction.disablesAnimations = true
+                        location = value.location.x
+                    }
                     .onChanged { value in
-                        dragOffset = value.translation.width
+                        let nextTab = layout.tab(at: value.location.x)
+                        guard selectedTab != nextTab else { return }
+                        // Only switch at cell boundaries, not on every pixel.
+                        // The glass follows absolute touch position independently.
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            selectedTab = nextTab
+                        }
                     }
                     .onEnded { value in
-                        let target = Int(((selectedOffset + value.translation.width) / tabStride).rounded())
-                        let nextTab = min(max(target, 0), tabs.count - 1)
-                        dragOffset = 0
-                        withAnimation(.spring(response: 0.34, dampingFraction: 0.78, blendDuration: 0.1)) {
-                            selectedTab = nextTab
+                        withAnimation(selectionAnimation) {
+                            selectedTab = layout.tab(at: value.location.x)
                         }
                     }
             )
         }
-        .frame(height: 58)
+        .frame(height: 56)
+    }
+
+    private var unselectedForeground: Color {
+        Color(uiColor: .label).opacity(colorScheme == .dark ? 0.84 : 0.72)
+    }
+
+    private var selectedForeground: Color {
+        Color(uiColor: .label)
+    }
+
+    private var selectionAnimation: Animation? {
+        reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.84, blendDuration: 0.08)
     }
 
     @ViewBuilder
     private var tabBarSurface: some View {
-        if #available(iOS 26.0, *) {
-            Color.clear
-                .glassEffect(.regular, in: Capsule(style: .continuous))
+        if reduceTransparency {
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .fill(DoveTheme.cardSurface.opacity(0.96))
                 .overlay {
-                    Capsule(style: .continuous)
-                        .stroke(.white.opacity(0.38), lineWidth: 0.8)
+                    RoundedRectangle(cornerRadius: 30, style: .continuous)
+                        .stroke(DoveTheme.ink.opacity(0.16), lineWidth: 0.8)
                 }
-                .shadow(color: .black.opacity(0.10), radius: 16, y: 6)
+                .shadow(color: .black.opacity(0.14), radius: 16, y: 6)
         } else {
-            Capsule(style: .continuous)
+            // A material shell avoids overlapping two refractive glass surfaces.
+            // The moving selection lens below is the sole Liquid Glass layer.
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
                 .fill(.ultraThinMaterial)
                 .overlay {
-                    Capsule(style: .continuous)
-                        .stroke(.white.opacity(0.24), lineWidth: 0.8)
+                    RoundedRectangle(cornerRadius: 30, style: .continuous)
+                        .stroke(DoveTheme.ink.opacity(0.14), lineWidth: 0.8)
                 }
-                .shadow(color: .black.opacity(0.12), radius: 14, y: 5)
+                .shadow(color: .black.opacity(0.14), radius: 16, y: 6)
+        }
+    }
+
+    @ViewBuilder
+    private var selectionBackdrop: some View {
+        if #available(iOS 26.0, *), !reduceTransparency {
+            GlassEffectContainer(spacing: 0) {
+                selectedTabSurface
+            }
+        } else {
+            selectedTabSurface
         }
     }
 
     @ViewBuilder
     private var selectedTabSurface: some View {
-        if #available(iOS 26.0, *) {
+        if reduceTransparency {
+            Capsule(style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+                .overlay { selectionEdge }
+        } else if #available(iOS 26.0, *) {
             Color.clear
-                .glassEffect(
-                    .regular.tint(DoveTheme.green.opacity(0.34)).interactive(),
-                    in: Capsule(style: .continuous)
-                )
-                .overlay {
-                    Capsule(style: .continuous)
-                        .stroke(.white.opacity(0.48), lineWidth: 0.9)
-                }
-                .shadow(color: DoveTheme.green.opacity(0.14), radius: 11, y: 4)
+                .glassEffect(.clear.interactive(), in: .capsule)
+                .overlay { selectionEdge }
+                .shadow(color: .black.opacity(colorScheme == .dark ? 0.2 : 0.08), radius: 5, y: 2)
         } else {
             Capsule(style: .continuous)
-                .fill(DoveTheme.green.opacity(0.13))
-                .background(.thinMaterial, in: Capsule(style: .continuous))
-                .overlay {
-                    Capsule(style: .continuous)
-                        .stroke(.white.opacity(0.25), lineWidth: 0.8)
-                }
+                .fill(.ultraThinMaterial)
+                .overlay { selectionEdge }
+                .shadow(color: .black.opacity(0.08), radius: 5, y: 2)
         }
     }
+
+    private var selectionEdge: some View {
+        Capsule(style: .continuous)
+            .strokeBorder(Color(uiColor: .label).opacity(colorScheme == .dark ? 0.24 : 0.14), lineWidth: 0.7)
+    }
+}
+
+/// Coordinates are local to the bar's content, excluding its outer padding.
+/// Keeping them independent of selectedTab prevents feedback as pages switch.
+private struct DoveTabBarLayout {
+    let width: CGFloat
+    let count: Int
+    var isRightToLeft = false
+    let spacing: CGFloat = 2
+
+    var tabWidth: CGFloat {
+        guard width.isFinite, count > 0 else { return 0 }
+        return max(0, (width - spacing * CGFloat(count - 1)) / CGFloat(count))
+    }
+
+    var stride: CGFloat { tabWidth + spacing }
+
+    var selectionWidth: CGFloat { min(tabWidth, min(72, max(58, tabWidth - 12))) }
+
+    func center(for tab: Int) -> CGFloat {
+        guard count > 0, tabWidth > 0 else { return 0 }
+        let logicalIndex = min(max(tab, 0), count - 1)
+        let visualIndex = isRightToLeft ? count - 1 - logicalIndex : logicalIndex
+        return tabWidth / 2 + CGFloat(visualIndex) * stride
+    }
+
+    func clampedCenter(_ x: CGFloat) -> CGFloat {
+        guard count > 0, tabWidth > 0, x.isFinite else { return center(for: 0) }
+        return min(max(x, tabWidth / 2), tabWidth / 2 + CGFloat(count - 1) * stride)
+    }
+
+    func tab(at x: CGFloat) -> Int {
+        guard count > 0, tabWidth > 0, x.isFinite else { return 0 }
+        let visualIndex = Int(((clampedCenter(x) - tabWidth / 2) / stride).rounded())
+        let boundedIndex = min(max(visualIndex, 0), count - 1)
+        return isRightToLeft ? count - 1 - boundedIndex : boundedIndex
+    }
+}
+
+private struct DoveBottomTabBarPreview: View {
+    @State private var selection = 0
+    private let titles = ["消息", "通讯录", "发现", "设置"]
+
+    var body: some View {
+        VStack {
+            Text("当前页面：\(titles[selection])")
+                .font(.headline)
+            Spacer()
+            DoveBottomTabBar(selectedTab: $selection, totalUnread: 23)
+        }
+        .padding(.top, 32)
+        .background(Color(uiColor: .systemBackground))
+    }
+}
+
+#Preview("透明导航 · 拖动切换") {
+    DoveBottomTabBarPreview()
+}
+
+#Preview("透明导航 · 深色") {
+    DoveBottomTabBarPreview()
+        .preferredColorScheme(.dark)
+}
+
+#Preview("透明导航 · 从右往左") {
+    DoveBottomTabBarPreview()
+        .environment(\.layoutDirection, .rightToLeft)
 }

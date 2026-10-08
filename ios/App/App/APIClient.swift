@@ -1,8 +1,15 @@
 import Foundation
 
+enum AppServer {
+    static let origin = "https://app.imim.chat"
+    static let apiBaseURL = "\(origin)/api"
+    static let signalURL = "wss://app.imim.chat/signal"
+    static let authKeychainService = "chat.imim.auth.app.imim.chat"
+}
+
 class APIClient {
     static let shared = APIClient()
-    private let baseURL = "https://wed.imim.chat/api"
+    private let baseURL = AppServer.apiBaseURL
     private let requiredTRTCSDKAppID = 1600159677
 
     private init() {}
@@ -12,13 +19,14 @@ class APIClient {
         method: String = "GET",
         body: [String: Any]? = nil,
         authTokenOverride: String? = nil,
-        cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy
+        cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy,
+        timeoutInterval: TimeInterval = 60
     ) async throws -> T {
         guard let url = URL(string: "\(baseURL)\(endpoint)") else {
             throw URLError(.badURL)
         }
 
-        var request = URLRequest(url: url, cachePolicy: cachePolicy)
+        var request = URLRequest(url: url, cachePolicy: cachePolicy, timeoutInterval: timeoutInterval)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -61,6 +69,12 @@ class APIClient {
                 "loginType": "password"
             ]
         )
+    }
+
+    func deleteAccount(userID: String, password: String, token: String) async throws -> AccountDeletionResponse {
+        try await request("/auth/account", method: "DELETE", body: [
+            "expectedUserId": userID, "password": password, "confirmation": "DELETE_ACCOUNT"
+        ], authTokenOverride: token, cachePolicy: .reloadIgnoringLocalCacheData)
     }
 
     func sendSMSCode(target: String, type: AuthCodeType) async throws -> AuthCodeResponse {
@@ -134,6 +148,27 @@ class APIClient {
         return response.friends
     }
 
+    func fetchFriendRequests() async throws -> [RemoteFriendRequest] {
+        let response: FriendRequestListResponse = try await request(
+            "/friend/requests?type=all", cachePolicy: .reloadIgnoringLocalCacheData
+        )
+        return response.requests
+    }
+
+    func respondToFriendRequest(id: String, accept: Bool) async throws -> FriendRequestDecisionResponse {
+        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#%"))
+        guard !id.isEmpty, let encoded = id.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            throw URLError(.badURL)
+        }
+        let response: FriendRequestDecisionResponse = try await request(
+            "/friend/\(accept ? "accept" : "reject")/\(encoded)", method: "POST", body: [:]
+        )
+        guard response.success != false else {
+            throw APIClientError.server(response.message ?? "处理好友申请失败")
+        }
+        return response
+    }
+
     func createChat(targetUserId: String) async throws -> RemoteChat {
         let response: ChatResponse = try await request(
             "/chat/create",
@@ -143,9 +178,107 @@ class APIClient {
         return response.chat
     }
 
-    func fetchChats() async throws -> [RemoteChat] {
-        let response: ChatListResponse = try await request("/chat/list")
+    func fetchChats(timeoutInterval: TimeInterval = 60) async throws -> [RemoteChat] {
+        let response: ChatListResponse = try await request("/chat/list", timeoutInterval: timeoutInterval)
         return response.chats
+    }
+
+    func fetchGroups(userId: String) async throws -> [RemoteGroup] {
+        guard let encodedUserId = userId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            throw URLError(.badURL)
+        }
+        let response: GroupListResponse = try await request(
+            "/group/list?userId=\(encodedUserId)",
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+        return response.groups
+    }
+
+    func fetchGroupMessages(groupId: String, userId: String, limit: Int = 50) async throws -> GroupMessageListResponse {
+        guard let encodedGroupId = groupId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let encodedUserId = userId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            throw URLError(.badURL)
+        }
+        return try await request(
+            "/group/messages?groupId=\(encodedGroupId)&userId=\(encodedUserId)&limit=\(limit)",
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    func acknowledgeGroupMessages(groupId: String, userId: String, lastAckSeq: Int) async throws {
+        let _: EmptyResponse = try await request(
+            "/group/ack",
+            method: "POST",
+            body: [
+                "groupId": groupId,
+                "userId": userId,
+                "lastAckSeq": lastAckSeq
+            ]
+        )
+    }
+
+    func requestMLSDeviceJoin(
+        groupId: String,
+        deviceId: String,
+        keyPackage: MLSKeyPackage
+    ) async throws -> MLSDeviceJoinRequestResponse {
+        try await request(
+            "/mls/device-join/request",
+            method: "POST",
+            body: [
+                "groupId": groupId,
+                "deviceId": deviceId,
+                "keyPackage": [
+                    "version": keyPackage.version,
+                    "cipherSuite": keyPackage.cipherSuite,
+                    "initKey": keyPackage.initKey,
+                    "leafKey": keyPackage.leafKey,
+                    "signature": keyPackage.signature,
+                    "userId": keyPackage.userId,
+                    "createdAt": keyPackage.createdAt,
+                    "expiresAt": keyPackage.expiresAt,
+                ],
+            ]
+        )
+    }
+
+    func fetchMLSDeviceWelcome(groupId: String, deviceId: String) async throws -> MLSDeviceWelcomeResponse {
+        guard let encodedGroupId = groupId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let encodedDeviceId = deviceId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            throw URLError(.badURL)
+        }
+        return try await request(
+            "/mls/device-join/welcome?groupId=\(encodedGroupId)&deviceId=\(encodedDeviceId)",
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    func acknowledgeMLSDeviceWelcome(requestId: String) async throws {
+        let _: EmptyResponse = try await request(
+            "/mls/device-join/ack",
+            method: "POST",
+            body: ["requestId": requestId]
+        )
+    }
+
+    func sendGroupMessage(
+        groupId: String,
+        senderId: String,
+        senderName: String?,
+        encryptedContent: String,
+        replyToId: String?,
+        extra: [String: Any]
+    ) async throws -> GroupSendResponse {
+        var body: [String: Any] = [
+            "groupId": groupId,
+            "senderId": senderId,
+            "msgType": "mls_encrypted",
+            "content": encryptedContent,
+            "extra": extra,
+        ]
+        if let senderName, !senderName.isEmpty { body["senderName"] = senderName }
+        if let replyToId, !replyToId.isEmpty { body["replyToId"] = replyToId }
+        return try await request("/group/send", method: "POST", body: body)
     }
 
     func updateChatPrivacy(
@@ -207,6 +340,7 @@ class APIClient {
                 "userId": userId,
                 "registrationId": bundle.registrationId,
                 "identityKey": bundle.identityKey,
+                "signingPublicKey": bundle.signingPublicKey ?? "",
                 "signedPreKey": signedPreKey,
                 "preKeys": preKeysPayload
             ]
@@ -226,6 +360,7 @@ class APIClient {
         return E2EEPreKeyBundle(
             registrationId: response.registrationId,
             identityKey: response.identityKey,
+            signingPublicKey: response.signingPublicKey,
             signedPreKeyId: signedPreKeyId,
             signedPreKey: signedPreKeyPublic,
             signedPreKeySignature: signedPreKeySignature,
@@ -258,7 +393,8 @@ class APIClient {
         chatId: String,
         encryptedEnvelope: String,
         replyToId: String? = nil,
-        extra: [String: Any]? = nil
+        extra: [String: Any]? = nil,
+        notificationText: String? = nil
     ) async throws -> RemoteMessage {
         let validatedEnvelope = try E2EEManager.shared.validateEnvelopeString(encryptedEnvelope)
         var body: [String: Any] = [
@@ -268,9 +404,12 @@ class APIClient {
         if let replyToId {
             body["replyToId"] = replyToId
         }
-        if let extra {
-            body["extra"] = extra
+        var combinedExtra = extra ?? [:]
+        if let notificationText {
+            let boxes = await encryptedNotificationPreviews(chatId: chatId, text: notificationText)
+            if !boxes.isEmpty { combinedExtra["notificationPreviews"] = boxes }
         }
+        if !combinedExtra.isEmpty { body["extra"] = combinedExtra }
 
         let response: MessageResponse = try await request(
             "/chat/\(chatId)/messages",
@@ -304,7 +443,7 @@ class APIClient {
         let boundary = "Boundary-\(UUID().uuidString)"
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 60
+        request.timeoutInterval = 180
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         if let token = AuthTokenStore.shared.token {
@@ -367,54 +506,64 @@ class APIClient {
         var body: [String: Any] = [
             "token": token,
             "platform": "ios",
-            "env": env.rawValue,
+            "environment": env.rawValue,
             "bundleId": Bundle.main.bundleIdentifier ?? ""
         ]
         if let appVersion, !appVersion.isEmpty {
             body["appVersion"] = appVersion
         }
-        // The authenticated bearer token is the user binding. Do not trust a
-        // userId supplied by the client, which would allow token reassignment.
-        do {
-            let _: EmptyResponse = try await request("/device/push-token", method: "POST", body: body)
-        } catch {
-            // Existing production nodes still expose the compatibility route.
-            let _: EmptyResponse = try await request("/apns/token", method: "POST", body: body)
+        if let userId = UserDefaults.standard.string(forKey: "current_user_id"),
+           let key = try? NotificationPreview.registration(userId: userId),
+           let data = try? JSONEncoder().encode(key),
+           let value = try? JSONSerialization.jsonObject(with: data) {
+            body["notificationPreviewKey"] = value
         }
+        // The authenticated bearer token is the user binding. APNs device
+        // tokens are only ever sent to the dedicated APNs endpoint.
+        let _: EmptyResponse = try await request("/apns/token", method: "POST", body: body)
     }
 
-    func registerVoIPToken(_ token: String) async throws {
+    func encryptedNotificationPreviews(chatId: String, text: String) async -> [String: Any] {
+        struct KeysResponse: Codable { let keys: [NotificationPreviewKey] }
+        guard let sender = UserDefaults.standard.string(forKey: "current_user_id"),
+              let encodedChat = chatId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let response: KeysResponse = try? await request("/apns/preview-keys?chatId=\(encodedChat)", timeoutInterval: 1.5) else { return [:] }
+        var boxes: [String: Any] = [:]
+        for key in response.keys.prefix(32) {
+            guard let box = try? NotificationPreview.seal(text, to: key, senderId: sender, chatId: chatId),
+                  let data = try? JSONEncoder().encode(box),
+                  let value = try? JSONSerialization.jsonObject(with: data) else { continue }
+            boxes[key.keyId] = value
+        }
+        return boxes
+    }
+
+    func registerVoIPToken(_ token: String, env: PushTokenEnvironment) async throws {
         let _: EmptyResponse = try await request(
             "/apns/voip-token",
             method: "POST",
-            body: ["voipToken": token]
+            body: [
+                "voipToken": token,
+                "environment": env.rawValue
+            ]
         )
     }
 
     func deletePushToken(token: String, authToken: String? = nil) async throws {
-        do {
-            let _: EmptyResponse = try await request(
-                "/device/push-token",
-                method: "DELETE",
-                body: ["token": token],
-                authTokenOverride: authToken
-            )
-        } catch {
-            let _: EmptyResponse = try await request(
-                "/apns/token",
-                method: "DELETE",
-                body: ["token": token],
-                authTokenOverride: authToken
-            )
-        }
+        let _: EmptyResponse = try await request(
+            "/apns/token",
+            method: "DELETE",
+            body: ["token": token],
+            authTokenOverride: authToken
+        )
     }
 
     func updatePushPresence(_ presence: String, activeChatId: String? = nil) async throws {
-        var body: [String: Any] = ["presence": presence]
+        var body: [String: Any] = ["state": presence]
         if let activeChatId, !activeChatId.isEmpty {
             body["activeChatId"] = activeChatId
         }
-        let _: EmptyResponse = try await request("/device/presence", method: "POST", body: body)
+        let _: EmptyResponse = try await request("/presence", method: "POST", body: body)
     }
 
     func recallMessage(chatId: String, messageId: String) async throws {
@@ -423,7 +572,7 @@ class APIClient {
 
     func updateProfile(nickname: String, bio: String) async throws -> ProfileUpdateResponse {
         try await request(
-            "/profile",
+            "/auth/profile",
             method: "PUT",
             body: [
                 "name": nickname,
@@ -438,12 +587,17 @@ class APIClient {
         let _: ProfileUpdateResponse = try await request(
             "/profile",
             method: "PUT",
-            body: ["backgroundUrl": backgroundURL]
+            body: ["userId": "me", "backgroundUrl": backgroundURL]
         )
     }
 
     func fetchCurrentProfile() async throws -> ProfilePayload {
-        let response: CurrentProfileResponse = try await request("/profile")
+        // The auth identity response omits the Moments cover. Read the same
+        // profile resource as Web, including an explicitly cleared cover.
+        let response: CurrentProfileResponse = try await request(
+            "/profile?userId=me",
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
         return response.profile
     }
 
@@ -483,7 +637,18 @@ class APIClient {
            let encoded = cursor.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
             endpoint += "&cursor=\(encoded)"
         }
-        return try await request(endpoint)
+        var feed: MomentFeedResponse = try await request(endpoint, cachePolicy: .reloadIgnoringLocalCacheData)
+        // Old uploads can be labelled "image" while the extensionless media
+        // endpoint actually serves a video. Resolve those records before layout.
+        for momentIndex in feed.moments.indices {
+            for mediaIndex in feed.moments[momentIndex].media.indices {
+                let item = feed.moments[momentIndex].media[mediaIndex]
+                if !item.isVideo, await MomentMediaTypeResolver.shared.isVideo(item.url) {
+                    feed.moments[momentIndex].media[mediaIndex].type = "video"
+                }
+            }
+        }
+        return feed
     }
 
     func toggleMomentLike(momentId: String) async throws -> MomentLikeResponse {
@@ -661,6 +826,11 @@ struct APIErrorResponse: Codable {
 
 struct EmptyResponse: Codable {}
 
+struct AccountDeletionResponse: Codable {
+    let success: Bool
+    let mediaCleanupPending: Bool?
+}
+
 enum AuthCodeType: String {
     case login
     case register
@@ -685,6 +855,10 @@ struct ProfilePayload: Codable {
     let avatar: String?
     let backgroundUrl: String?
     let bio: String?
+}
+
+struct AuthMeResponse: Codable {
+    let user: ProfilePayload
 }
 
 struct CurrentProfileResponse: Codable {
@@ -726,14 +900,48 @@ struct FriendRequestResult: Codable {
     let request: RemoteFriendRequest?
 }
 
-struct RemoteFriendRequest: Codable {
+struct FriendRequestListResponse: Codable {
+    let requests: [RemoteFriendRequest]
+}
+
+struct FriendRequestDecisionResponse: Codable {
+    var success: Bool? = nil
+    var message: String? = nil
+    var chatId: String? = nil
+}
+
+struct RemoteFriendRequest: Codable, Identifiable {
     let id: String
     let fromId: String
     let toId: String
     let message: String?
-    let status: String
+    var status: String
     let searchMethod: String?
     let createdAt: Int64?
+    var fromName: String? = nil
+    var fromUniqueId: String? = nil
+    var fromAvatar: String? = nil
+    var toName: String? = nil
+    var toAvatar: String? = nil
+    var timestamp: Double? = nil
+    var isIncoming: Bool? = nil
+
+    func incoming(for userId: String?) -> Bool {
+        if let userId, !userId.isEmpty { return toId == userId }
+        return isIncoming == true
+    }
+
+    func peerId(for userId: String?) -> String { incoming(for: userId) ? fromId : toId }
+    func peerName(for userId: String?) -> String {
+        let value = incoming(for: userId) ? fromName : toName
+        if let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty { return value }
+        return peerId(for: userId)
+    }
+    func peerAvatar(for userId: String?) -> String? { incoming(for: userId) ? fromAvatar : toAvatar }
+    var requestDate: Date? {
+        guard let raw = timestamp ?? createdAt.map(Double.init), raw > 0 else { return nil }
+        return Date(timeIntervalSince1970: raw > 100_000_000_000 ? raw / 1000 : raw)
+    }
 }
 
 struct FriendListResponse: Codable {
@@ -761,6 +969,132 @@ struct ChatListResponse: Codable {
 
 struct ChatResponse: Codable {
     let chat: RemoteChat
+}
+
+struct GroupListResponse: Codable {
+    let groups: [RemoteGroup]
+}
+
+struct GroupMessageListResponse: Codable {
+    let messages: [RemoteGroupMessage]
+    let hasMore: Bool
+    let latestSeq: Int
+}
+
+struct MLSDeviceJoinRequestResponse: Codable {
+    let ok: Bool
+    let requestId: String
+}
+
+struct MLSDeviceWelcomeResponse: Codable {
+    let ready: Bool
+    let requestId: String?
+    let welcome: MLSWelcome?
+    let senderIdentityKey: String?
+}
+
+struct GroupSendResponse: Codable {
+    let ok: Bool
+    let seq: Int
+    let timestamp: Int64
+    let messageId: String?
+}
+
+struct RemoteGroupMessage: Codable, Hashable {
+    let id: String
+    let seq: Int
+    let senderId: String
+    let senderName: String?
+    let senderAvatar: String?
+    let msgType: String
+    let content: String
+    let replyToId: String?
+    let extra: RemoteMessageExtra?
+    let createdAt: String
+    let isRevoked: Bool
+
+    func toLocalMessage(currentUserId: String?, groupId: String) -> Message {
+        let displayContent: String
+        let displayType: String
+        if isRevoked {
+            displayContent = "消息已撤回"
+            displayType = "text"
+        } else if msgType == "system" {
+            displayContent = content
+            displayType = "system"
+        } else if msgType == "mls_encrypted" {
+            displayContent = "🔒 加密群消息"
+            displayType = extra?.originalType ?? "text"
+        } else {
+            // Group chats must never display or accept plaintext payloads.
+            displayContent = "🔒 不支持的群消息"
+            displayType = "text"
+        }
+
+        return Message(
+            messageId: "\(groupId):\(seq)",
+            chatId: groupId,
+            senderId: senderId,
+            content: displayContent,
+            type: displayType,
+            status: "received",
+            createdAt: Self.parseDate(createdAt),
+            isOutgoing: senderId == currentUserId,
+            chat: nil
+        )
+    }
+
+    func toLocalMessageResolvingMLS(currentUserId: String?, groupId: String) async -> Message {
+        guard !isRevoked, msgType == "mls_encrypted" else {
+            return toLocalMessage(currentUserId: currentUserId, groupId: groupId)
+        }
+
+        let displayContent: String
+        if let userId = currentUserId,
+           let data = content.data(using: .utf8),
+           let wire = try? JSONDecoder().decode(MLSWireEnvelope.self, from: data),
+           let plaintext = try? await MLSGroupManager.shared.decrypt(wire, groupId: groupId, userId: userId) {
+            displayContent = plaintext
+        } else {
+            displayContent = "🔒 加密群消息（等待密钥同步）"
+        }
+
+        return Message(
+            messageId: "\(groupId):\(seq)",
+            chatId: groupId,
+            senderId: senderId,
+            content: displayContent,
+            type: extra?.originalType ?? "text",
+            status: "received",
+            createdAt: Self.parseDate(createdAt),
+            isOutgoing: senderId == currentUserId,
+            chat: nil
+        )
+    }
+
+    private static func parseDate(_ value: String) -> Date {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        return ISO8601DateFormatter().date(from: value) ?? Date()
+    }
+}
+
+struct RemoteGroup: Codable, Hashable {
+    let id: String?
+    let groupId: String?
+    let name: String?
+    let avatar: String?
+    let unreadCount: Int?
+    let lastMessage: String?
+    let createdAt: Int64?
+    let updatedAt: Int64?
+
+    var resolvedId: String? {
+        let value = groupId ?? id
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
 }
 
 struct GroupCreateResponse: Codable {
@@ -824,7 +1158,7 @@ struct TRTCUserSigEnvelope: Codable {
 }
 
 struct MomentFeedResponse: Codable {
-    let moments: [MomentFeedItem]
+    var moments: [MomentFeedItem]
     let nextCursor: String?
     let hasMore: Bool?
 }
@@ -854,16 +1188,17 @@ struct MomentFeedItem: Codable, Identifiable, Hashable {
     let authorName: String
     let authorAvatar: String?
     let content: String
-    let media: [MomentMediaItem]
+    var media: [MomentMediaItem]
     let location: String?
     let likeCount: Int
     let commentCount: Int
+    let comments: [MomentComment]
     let isLiked: Bool
     let createdAt: Int64
 
     enum CodingKeys: String, CodingKey {
         case id, authorId, authorName, authorAvatar, content, media, location
-        case likeCount, commentCount, isLiked, createdAt
+        case likeCount, commentCount, comments, isLiked, createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -877,13 +1212,35 @@ struct MomentFeedItem: Codable, Identifiable, Hashable {
         location = try container.decodeIfPresent(String.self, forKey: .location)
         likeCount = try container.decodeIfPresent(Int.self, forKey: .likeCount) ?? 0
         commentCount = try container.decodeIfPresent(Int.self, forKey: .commentCount) ?? 0
+        comments = try container.decodeIfPresent([MomentComment].self, forKey: .comments) ?? []
         isLiked = try container.decodeIfPresent(Bool.self, forKey: .isLiked) ?? false
         createdAt = try container.decodeFlexibleMillisecondsIfPresent(forKey: .createdAt) ?? 0
     }
 }
 
+struct MomentComment: Codable, Identifiable, Hashable {
+    let id: String
+    let userName: String
+    let content: String
+    let replyToUserName: String?
+    let isDeleted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, userName, content, replyToUserName, isDeleted
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        userName = try values.decodeIfPresent(String.self, forKey: .userName) ?? ""
+        content = try values.decodeIfPresent(String.self, forKey: .content) ?? ""
+        replyToUserName = try values.decodeIfPresent(String.self, forKey: .replyToUserName)
+        isDeleted = try values.decodeIfPresent(Bool.self, forKey: .isDeleted) ?? false
+    }
+}
+
 struct MomentMediaItem: Codable, Hashable {
-    let type: String
+    var type: String
     let url: String
     let thumbUrl: String?
     let mediumUrl: String?
@@ -927,20 +1284,64 @@ struct MomentMediaItem: Codable, Hashable {
     }
 
     var playbackURLString: String? {
-        videoUrl ?? mediaUrl ?? fileUrl ?? url.nilIfBlank
+        videoUrl?.nilIfBlank ?? mediaUrl?.nilIfBlank ?? fileUrl?.nilIfBlank ?? url.nilIfBlank
     }
 
     var previewURLString: String? {
-        posterUrl ?? thumbUrl ?? mediumUrl ?? url.nilIfBlank
+        posterUrl?.nilIfBlank ?? thumbUrl?.nilIfBlank ?? mediumUrl?.nilIfBlank ?? url.nilIfBlank
     }
 
-    /// The server currently returns `video`, but older records can contain a MIME type.
+    /// The server currently returns `video`, but older records can contain a MIME type
+    /// or an incorrect/default `image` value while still carrying a dedicated video URL.
     var isVideo: Bool {
         let normalizedType = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalizedType == "video"
+        if normalizedType == "video"
             || normalizedType.hasPrefix("video/")
-            || normalizedType.contains("video")
-            || playbackURLString?.lowercased().contains(".m3u8") == true
+            || normalizedType.contains("video") {
+            return true
+        }
+
+        // `videoUrl` is emitted only for playable video media. Treat it as the
+        // strongest signal so legacy records are never handed to AsyncImage.
+        if videoUrl?.nilIfBlank != nil {
+            return true
+        }
+
+        guard let source = playbackURLString?.lowercased(), !source.isEmpty else {
+            return false
+        }
+        let pathExtension = URL(string: source)?.pathExtension.lowercased()
+        return ["mp4", "mov", "m4v", "m3u8", "webm", "mkv"].contains(pathExtension ?? "")
+            || [".mp4", ".mov", ".m4v", ".m3u8", ".webm", ".mkv"].contains { source.contains($0) }
+    }
+}
+
+private actor MomentMediaTypeResolver {
+    static let shared = MomentMediaTypeResolver()
+    private var videoTypes: [URL: Bool] = [:]
+
+    func isVideo(_ source: String) async -> Bool {
+        guard let url = URL(string: source, relativeTo: URL(string: AppServer.origin))?.absoluteURL,
+              url.host == URL(string: AppServer.origin)?.host,
+              url.path.hasPrefix("/api/media/"),
+              url.pathExtension.isEmpty else { return false }
+        if let cached = videoTypes[url] { return cached }
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 10
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            try Task.checkCancellation()
+            guard let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode),
+                  let mime = http.mimeType else { return false }
+            let video = mime.lowercased().hasPrefix("video/")
+            videoTypes[url] = video
+            return video
+        } catch {
+            // Don't cache network failures as image classifications.
+            return false
+        }
     }
 }
 
@@ -1009,6 +1410,7 @@ struct RemoteE2EEPreKey: Codable, Hashable {
 struct RemoteE2EEBundleResponse: Codable, Hashable {
     let registrationId: Int
     let identityKey: String
+    let signingPublicKey: String?
     let signedPreKey: RemoteE2EESignedPreKey
     let preKey: RemoteE2EEPreKey?
 }
@@ -1094,22 +1496,27 @@ extension RemoteMessage {
         let message = toLocalMessage(currentUserId: currentUserId, chat: chat)
         guard msgType == "encrypted" else { return message }
 
+        // Attachment retries use their saved key, never consume the Signal
+        // envelope twice or disturb the current chat ratchet.
+        if let owner = currentUserId,
+           let metadata = try? await EncryptedMediaStore.shared.metadata(owner: owner, messageID: id) {
+            await resolveMedia(metadata, message: message, owner: owner)
+            return message
+        }
+
         if senderId == currentUserId {
             message.content = message.type == "text" ? "🔒 已发送加密消息" : message.content
+            if ["image", "voice", "video", "file"].contains(message.type) {
+                message.mediaURL = nil
+                message.voiceURL = nil
+            }
             return message
         }
 
         do {
             let decrypted = try await E2EEManager.shared.decryptText(content, peerId: senderId)
             if let media = Self.decodeEncryptedMediaMetadata(decrypted) {
-                message.type = media.originalType ?? message.type
-                message.content = media.displayText
-                message.fileName = media.fileName ?? message.fileName
-                message.mimeType = media.mimeType ?? message.mimeType
-                message.voiceDuration = media.duration ?? message.voiceDuration
-                if let waveform = media.waveform, !waveform.isEmpty {
-                    message.voiceWaveform = waveform
-                }
+                await resolveMedia(media, message: message, owner: currentUserId)
             } else if message.type == "text" {
                 message.content = decrypted
             } else {
@@ -1119,8 +1526,10 @@ extension RemoteMessage {
             // Keep ciphertext and secrets out of logs. The failure category is
             // enough to distinguish a stale-device bundle from transport bugs.
             print("[E2EE] decrypt failed message=\(id) sender=\(senderId) error=\(error.localizedDescription)")
-            SocketManager.shared.requestEncryptionSessionReset(with: senderId)
             message.content = "🔒 加密消息（等待密钥同步）"
+            // A raw ciphertext attachment must never reach an image/audio player.
+            message.voiceURL = nil
+            message.mediaURL = nil
         }
         return message
     }
@@ -1130,21 +1539,32 @@ extension RemoteMessage {
         return try? JSONDecoder().decode(EncryptedMediaMetadata.self, from: data)
     }
 
-    private struct EncryptedMediaMetadata: Decodable {
-        let originalType: String?
-        let fileName: String?
-        let mimeType: String?
-        let duration: Double?
-        let waveform: [Double]?
-
-        var displayText: String {
-            switch originalType {
-            case "image": return "[加密图片]"
-            case "voice": return "[加密语音]"
-            case "video": return "[加密视频]"
-            case "file": return fileName ?? "[加密文件]"
-            default: return "🔒 加密消息"
+    private func resolveMedia(_ metadata: EncryptedMediaMetadata, message: Message, owner: String?) async {
+        let source = message.voiceURL ?? message.mediaURL
+        message.type = metadata.originalType
+        message.content = metadata.displayText
+        message.fileName = metadata.fileName
+        message.mimeType = metadata.mimeType
+        message.fileSize = metadata.byteSize
+        message.voiceDuration = metadata.duration
+        message.voiceWaveform = metadata.waveform ?? []
+        message.voiceURL = nil
+        message.mediaURL = nil
+        guard let owner, let origin = URL(string: AppServer.origin) else { return }
+        do {
+            // A pre-existing record must keep its original ciphertext URL.
+            if (try? await EncryptedMediaStore.shared.metadata(owner: owner, messageID: id)) == nil {
+                try await EncryptedMediaStore.shared.remember(owner: owner, messageID: id,
+                                                             metadata: metadata, remoteURL: source)
             }
+            let local = try await EncryptedMediaStore.shared.localFile(owner: owner, messageID: id, origin: origin)
+            guard owner == UserDefaults.standard.string(forKey: "current_user_id") else { return }
+            message.mediaURL = local.absoluteString
+            if metadata.originalType == "voice" { message.voiceURL = local.absoluteString }
+        } catch {
+            // Transport/cache failures are retryable attachment failures, not
+            // Signal session failures. Keys remain available in Keychain.
+            print("[Media] attachment unavailable message=\(id)")
         }
     }
 }

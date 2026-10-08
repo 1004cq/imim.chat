@@ -477,7 +477,7 @@ final class TRTCManager: NSObject, ObservableObject {
 #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
 extension TRTCManager: TRTCCloudDelegate {
     nonisolated func onError(_ errCode: TXLiteAVError, errMsg: String?, extInfo: [AnyHashable: Any]?) {
-        Task { @MainActor in
+        Task { @MainActor [self] in
             let message = errMsg?.trimmingCharacters(in: .whitespacesAndNewlines)
             print("[TRTC] error code=\(errCode.rawValue) message=\(message ?? "") info=\(extInfo ?? [:])")
 

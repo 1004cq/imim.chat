@@ -36,9 +36,34 @@ final class ChatDetailViewModel: ObservableObject {
         defer { isLoadingMessages = false }
 
         do {
-            try await E2EEManager.shared.synchronizeCurrentUser()
-            let remoteMessages = try await APIClient.shared.fetchMessages(chatId: chat.chatId)
-            await merge(remoteMessages: remoteMessages, into: chat)
+            if chat.type == "group" {
+                guard let currentUserId = UserDefaults.standard.string(forKey: "current_user_id"),
+                      !currentUserId.isEmpty else {
+                    throw APIClientError.server("缺少当前用户 ID，无法读取群消息")
+                }
+                let hasMLSState = try await MLSGroupManager.shared.prepareGroup(
+                    groupId: chat.chatId,
+                    userId: currentUserId,
+                    waitForWelcome: true
+                )
+                if !hasMLSState {
+                    noticeMessage = MLSGroupError.waitingForExistingDevice.localizedDescription
+                }
+                let response = try await APIClient.shared.fetchGroupMessages(
+                    groupId: chat.chatId,
+                    userId: currentUserId
+                )
+                await merge(groupMessages: response.messages, into: chat, currentUserId: currentUserId)
+                try await APIClient.shared.acknowledgeGroupMessages(
+                    groupId: chat.chatId,
+                    userId: currentUserId,
+                    lastAckSeq: response.latestSeq
+                )
+            } else {
+                try await E2EEManager.shared.synchronizeCurrentUser()
+                let remoteMessages = try await APIClient.shared.fetchMessages(chatId: chat.chatId)
+                await merge(remoteMessages: remoteMessages, into: chat)
+            }
             chat.unreadCount = 0
             save(modelContext)
         } catch {
@@ -50,6 +75,10 @@ final class ChatDetailViewModel: ObservableObject {
     /// must create a new ratchet. Reloading the same ciphertext cannot recover
     /// a private key that is no longer on this device.
     func recoverEncryptionSession(for chat: Chat, modelContext: ModelContext) async {
+        guard chat.type != "group" else {
+            errorMessage = "群聊使用 MLS 密钥，不能用私聊安全会话重置功能恢复"
+            return
+        }
         guard let peerId = peerUserId(for: chat) else {
             errorMessage = "缺少对方用户 ID，无法重建加密会话"
             return
@@ -58,8 +87,9 @@ final class ChatDetailViewModel: ObservableObject {
         errorMessage = nil
         noticeMessage = nil
         do {
-            try E2EEManager.shared.resetSession(with: peerId)
+            try await E2EEManager.shared.resetSession(with: peerId)
             try await E2EEManager.shared.synchronizeCurrentUser(forceBundleRegistration: true)
+            SocketManager.shared.requestEncryptionSessionReset(with: peerId)
             noticeMessage = "已将这台手机的新密钥同步到服务器；请让对方发送一条新消息以重新建立加密会话。"
             save(modelContext)
         } catch {
@@ -74,6 +104,10 @@ final class ChatDetailViewModel: ObservableObject {
         restrictForwarding: Bool,
         modelContext: ModelContext
     ) async {
+        guard chat.type != "group" else {
+            errorMessage = "群聊不支持私聊的消失消息与转发限制设置"
+            return
+        }
         guard AuthTokenStore.shared.token != nil else {
             errorMessage = "请先登录后再修改会话安全设置"
             return
@@ -97,6 +131,10 @@ final class ChatDetailViewModel: ObservableObject {
     func sendMessage(_ content: String, in chat: Chat, modelContext: ModelContext) async {
         let content = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty else { return }
+        if chat.type == "group" {
+            await sendGroupTextMessage(content, in: chat, modelContext: modelContext)
+            return
+        }
         let tempId = UUID().uuidString
         let peerId = peerUserId(for: chat)
 
@@ -145,7 +183,8 @@ final class ChatDetailViewModel: ObservableObject {
 
         do {
             let encryptedEnvelope = try await E2EEManager.shared.encryptText(content, peerId: peerId)
-            let remoteMessage = try await APIClient.shared.sendMessage(chatId: chat.chatId, encryptedEnvelope: encryptedEnvelope, replyToId: replyToId)
+            let remoteMessage = try await APIClient.shared.sendMessage(chatId: chat.chatId, encryptedEnvelope: encryptedEnvelope, replyToId: replyToId,
+                notificationText: chat.vanishMode ? nil : content)
             let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
             apply(remoteMessage, to: tempMessage, currentUserId: currentUserId)
             tempMessage.content = content
@@ -161,6 +200,10 @@ final class ChatDetailViewModel: ObservableObject {
     }
 
     func sendSticker(_ item: StickerItem, from pack: StickerPack?, in chat: Chat, modelContext: ModelContext) async {
+        guard chat.type != "group" else {
+            errorMessage = groupEncryptionUnavailableMessage
+            return
+        }
         if item.isEmoji {
             let emoji = item.emoji?.isEmpty == false ? item.emoji! : "🙂"
             await sendMessage(emoji, in: chat, modelContext: modelContext)
@@ -235,7 +278,8 @@ final class ChatDetailViewModel: ObservableObject {
             let remoteMessage = try await APIClient.shared.sendMessage(
                 chatId: chat.chatId,
                 encryptedEnvelope: encryptedEnvelope,
-                extra: extra
+                extra: extra,
+                notificationText: chat.vanishMode ? nil : "[贴纸]"
             )
             let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
             apply(remoteMessage, to: tempMessage, currentUserId: currentUserId)
@@ -260,6 +304,10 @@ final class ChatDetailViewModel: ObservableObject {
     }
 
     func sendVoiceMessage(_ recording: VoiceRecordingResult, in chat: Chat, modelContext: ModelContext) async {
+        guard chat.type != "group" else {
+            errorMessage = groupEncryptionUnavailableMessage
+            return
+        }
         let tempId = UUID().uuidString
         let tempMessage = Message(
             messageId: tempId,
@@ -320,15 +368,22 @@ final class ChatDetailViewModel: ObservableObject {
                 waveform: recording.waveform
             )
             let localVoiceURL = tempMessage.voiceURL
-            let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
+            let currentUserId = tempMessage.senderId
+            let cached = try? await EncryptedMediaStore.shared.saveOutgoing(
+                owner: currentUserId, messageID: remoteMessage.id, metadata: encrypted.metadata,
+                remoteURL: remoteMessage.extra?.voiceUrl ?? remoteMessage.extra?.mediaUrl, plaintext: voiceData
+            )
+            guard currentUserId == UserDefaults.standard.string(forKey: "current_user_id") else { return }
             apply(remoteMessage, to: tempMessage, currentUserId: currentUserId)
             tempMessage.type = "voice"
             tempMessage.content = "[语音消息]"
-            tempMessage.voiceURL = tempMessage.voiceURL ?? localVoiceURL
-            tempMessage.voiceDuration = tempMessage.voiceDuration ?? recording.duration
-            if tempMessage.voiceWaveform.isEmpty {
-                tempMessage.voiceWaveform = recording.waveform
-            }
+            tempMessage.voiceURL = cached?.absoluteString ?? localVoiceURL
+            tempMessage.mediaURL = tempMessage.voiceURL
+            tempMessage.voiceDuration = recording.duration
+            tempMessage.voiceWaveform = recording.waveform
+            tempMessage.fileName = encrypted.metadata.fileName
+            tempMessage.mimeType = encrypted.metadata.mimeType
+            tempMessage.fileSize = voiceData.count
             chat.lastMessage = previewText(for: tempMessage)
             chat.updatedAt = tempMessage.createdAt
             save(modelContext)
@@ -347,6 +402,10 @@ final class ChatDetailViewModel: ObservableObject {
         in chat: Chat,
         modelContext: ModelContext
     ) async {
+        guard chat.type != "group" else {
+            errorMessage = groupEncryptionUnavailableMessage
+            return
+        }
         let tempId = UUID().uuidString
         let placeholder = type == "image" ? "[图片]" : type == "video" ? "[视频]" : fileName
         let localURL = persistLocalMedia(data: data, fileName: fileName)
@@ -405,14 +464,19 @@ final class ChatDetailViewModel: ObservableObject {
                 mimeType: "application/octet-stream"
             )
             let localMediaURL = tempMessage.mediaURL
-            let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
+            let currentUserId = tempMessage.senderId
+            let cached = try? await EncryptedMediaStore.shared.saveOutgoing(
+                owner: currentUserId, messageID: remoteMessage.id, metadata: encrypted.metadata,
+                remoteURL: remoteMessage.extra?.mediaUrl, plaintext: data
+            )
+            guard currentUserId == UserDefaults.standard.string(forKey: "current_user_id") else { return }
             apply(remoteMessage, to: tempMessage, currentUserId: currentUserId)
             tempMessage.type = type
             tempMessage.content = placeholder
-            tempMessage.mediaURL = tempMessage.mediaURL ?? localMediaURL
-            tempMessage.fileName = tempMessage.fileName ?? fileName
-            tempMessage.fileSize = tempMessage.fileSize ?? data.count
-            tempMessage.mimeType = tempMessage.mimeType ?? mimeType
+            tempMessage.mediaURL = cached?.absoluteString ?? localMediaURL
+            tempMessage.fileName = fileName
+            tempMessage.fileSize = data.count
+            tempMessage.mimeType = mimeType
             chat.lastMessage = previewText(for: tempMessage)
             chat.updatedAt = tempMessage.createdAt
             save(modelContext)
@@ -446,19 +510,24 @@ final class ChatDetailViewModel: ObservableObject {
                     existing.content = message.content
                     existing.type = message.type
                 }
-                existing.voiceURL = message.voiceURL
-                existing.voiceDuration = message.voiceDuration
-                existing.voiceWaveform = message.voiceWaveform
-                existing.mediaURL = message.mediaURL
+                // HTTP/WebSocket ACKs contain ciphertext URLs. Keep the local
+                // playable file and original metadata of encrypted attachments.
+                let keepAttachment = ["voice", "image", "video", "file"].contains(existing.type)
+                if !keepAttachment {
+                    existing.voiceURL = message.voiceURL
+                    existing.voiceDuration = message.voiceDuration
+                    existing.voiceWaveform = message.voiceWaveform
+                    existing.mediaURL = message.mediaURL
+                    existing.fileName = message.fileName
+                    existing.fileSize = message.fileSize
+                    existing.mimeType = message.mimeType
+                }
                 existing.stickerURL = message.stickerURL
                 existing.stickerEmoji = message.stickerEmoji
                 existing.stickerName = message.stickerName
                 existing.stickerFormat = message.stickerFormat
                 existing.stickerThumbURL = message.stickerThumbURL
                 existing.stickerPackID = message.stickerPackID
-                existing.fileName = message.fileName
-                existing.fileSize = message.fileSize
-                existing.mimeType = message.mimeType
                 existing.status = "sent"
                 existing.createdAt = message.createdAt
                 existing.isOutgoing = true
@@ -489,6 +558,10 @@ final class ChatDetailViewModel: ObservableObject {
 
     func markAsRead(_ chat: Chat, modelContext: ModelContext) {
         chat.unreadCount = 0
+        if chat.type == "group" {
+            save(modelContext)
+            return
+        }
         let unreadIncoming = chat.messages.filter { !$0.isOutgoing && $0.readAt == nil }
         if ConversationPreferences.readReceiptsEnabled(for: chat.chatId), !unreadIncoming.isEmpty {
             SocketManager.shared.sendReadReceipt(
@@ -522,6 +595,10 @@ final class ChatDetailViewModel: ObservableObject {
 
     func recall(_ message: Message, in chat: Chat, modelContext: ModelContext) async {
         guard message.isOutgoing else { return }
+        guard chat.type != "group" else {
+            errorMessage = "当前 iOS 版本尚未接入 MLS 群消息撤回"
+            return
+        }
 
         if AuthTokenStore.shared.token != nil {
             do {
@@ -543,39 +620,172 @@ final class ChatDetailViewModel: ObservableObject {
         save(modelContext)
     }
 
+    func retryMedia(_ message: Message, modelContext: ModelContext) async {
+        guard let owner = UserDefaults.standard.string(forKey: "current_user_id"),
+              let origin = URL(string: AppServer.origin) else { return }
+        do {
+            let local = try await EncryptedMediaStore.shared.localFile(owner: owner, messageID: message.messageId, origin: origin)
+            guard owner == UserDefaults.standard.string(forKey: "current_user_id") else { return }
+            message.mediaURL = local.absoluteString
+            if message.type == "voice" { message.voiceURL = local.absoluteString }
+            save(modelContext)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
     private func merge(remoteMessages: [RemoteMessage], into chat: Chat) async {
         let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
-        let existingIds = Set(chat.messages.map(\.messageId))
+        var existingIds = Set(chat.messages.map(\.messageId))
 
-        for remoteMessage in remoteMessages {
+        // The ratchet is order-sensitive. Always process newly fetched
+        // ciphertext from oldest to newest, independent of API ordering.
+        for remoteMessage in remoteMessages.sorted(by: { $0.createdAt < $1.createdAt }) {
             if existingIds.contains(remoteMessage.id) {
-                guard remoteMessage.msgType == "encrypted",
-                      remoteMessage.senderId != currentUserId,
-                      let existingMessage = chat.messages.first(where: { $0.messageId == remoteMessage.id }),
-                      existingMessage.content.contains("等待密钥同步") else {
-                    continue
+                if let existing = chat.messages.first(where: { $0.messageId == remoteMessage.id }),
+                   ["image", "voice", "video", "file"].contains(existing.type),
+                   let owner = currentUserId, let origin = URL(string: AppServer.origin),
+                   let local = try? await EncryptedMediaStore.shared.localFile(owner: owner, messageID: existing.messageId, origin: origin),
+                   owner == UserDefaults.standard.string(forKey: "current_user_id") {
+                    existing.mediaURL = local.absoluteString
+                    if existing.type == "voice" { existing.voiceURL = local.absoluteString }
                 }
-
-                let resolvedMessage = await remoteMessage.toLocalMessageResolvingEncryption(currentUserId: currentUserId, chat: chat)
-                guard !resolvedMessage.content.contains("等待密钥同步") else { continue }
-                existingMessage.content = resolvedMessage.content
-                existingMessage.type = resolvedMessage.type
-                existingMessage.voiceURL = resolvedMessage.voiceURL
-                existingMessage.voiceDuration = resolvedMessage.voiceDuration
-                existingMessage.voiceWaveform = resolvedMessage.voiceWaveform
-                existingMessage.mediaURL = resolvedMessage.mediaURL
-                existingMessage.fileName = resolvedMessage.fileName
-                existingMessage.mimeType = resolvedMessage.mimeType
+                // A failed historical ciphertext may reference an already
+                // consumed PreKey. Retrying it on every refresh used to reset
+                // the live session and made the next real-time message fail.
                 continue
             }
 
+            if let stored = IncomingMessagePersistence.shared.stored(remoteMessage.id, owner: currentUserId) {
+                if !chat.messages.contains(where: { $0.messageId == stored.messageId }) {
+                    chat.messages.append(stored)
+                }
+                existingIds.insert(remoteMessage.id)
+                continue
+            }
+            guard IncomingMessagePersistence.shared.begin(remoteMessage.id, owner: currentUserId) else { continue }
             let localMessage = await remoteMessage.toLocalMessageResolvingEncryption(currentUserId: currentUserId)
-            chat.messages.append(localMessage)
+            // Historical failures never initiate a reset of the live peer.
+            // Recovery is an explicit user action, not a consequence of paging.
+            let stored = IncomingMessagePersistence.shared.store(localMessage, owner: currentUserId, saveImmediately: false)
+            if let stored, !chat.messages.contains(where: { $0.messageId == stored.messageId }) {
+                chat.messages.append(stored)
+            }
+            existingIds.insert(remoteMessage.id)
         }
 
         if let last = chat.messages.max(by: { $0.createdAt < $1.createdAt }) {
             chat.lastMessage = previewText(for: last)
             chat.updatedAt = last.createdAt
+        }
+    }
+
+    private func merge(groupMessages: [RemoteGroupMessage], into chat: Chat, currentUserId: String) async {
+        var existingIds = Set(chat.messages.map(\.messageId))
+        for remoteMessage in groupMessages {
+            let stableMessageId = "\(chat.chatId):\(remoteMessage.seq)"
+            if existingIds.contains(stableMessageId) {
+                guard let existing = chat.messages.first(where: { $0.messageId == stableMessageId }),
+                      existing.content.contains("等待密钥同步") else { continue }
+                let resolved = await remoteMessage.toLocalMessageResolvingMLS(
+                    currentUserId: currentUserId,
+                    groupId: chat.chatId
+                )
+                if !resolved.content.contains("等待密钥同步") {
+                    existing.content = resolved.content
+                    existing.type = resolved.type
+                }
+                continue
+            }
+            let local = await remoteMessage.toLocalMessageResolvingMLS(
+                currentUserId: currentUserId,
+                groupId: chat.chatId
+            )
+            chat.messages.append(local)
+            existingIds.insert(stableMessageId)
+        }
+
+        if let last = chat.messages.max(by: { $0.createdAt < $1.createdAt }) {
+            chat.lastMessage = previewText(for: last)
+            chat.updatedAt = last.createdAt
+        }
+    }
+
+    private func sendGroupTextMessage(_ content: String, in chat: Chat, modelContext: ModelContext) async {
+        guard AuthTokenStore.shared.token != nil else {
+            errorMessage = "请先登录后再建立群聊加密密钥"
+            return
+        }
+        guard let currentUserId = UserDefaults.standard.string(forKey: "current_user_id"),
+              !currentUserId.isEmpty else {
+            errorMessage = "缺少当前用户 ID，无法建立群聊加密密钥"
+            return
+        }
+
+        isSending = true
+        errorMessage = nil
+        noticeMessage = nil
+        defer { isSending = false }
+
+        do {
+            let ready = try await MLSGroupManager.shared.prepareGroup(
+                groupId: chat.chatId,
+                userId: currentUserId,
+                waitForWelcome: true
+            )
+            guard ready else { throw MLSGroupError.waitingForExistingDevice }
+
+            let encrypted = try await MLSGroupManager.shared.encrypt(
+                content,
+                groupId: chat.chatId,
+                userId: currentUserId
+            )
+            guard let wireData = encrypted.data(using: .utf8),
+                  let wire = try? JSONDecoder().decode(MLSWireEnvelope.self, from: wireData) else {
+                throw MLSGroupError.invalidKeyMaterial
+            }
+
+            let tempMessage = Message(
+                messageId: UUID().uuidString,
+                chatId: chat.chatId,
+                senderId: currentUserId,
+                content: content,
+                type: "text",
+                status: "sending",
+                createdAt: Date(),
+                isOutgoing: true,
+                chat: nil
+            )
+            chat.messages.append(tempMessage)
+            chat.lastMessage = content
+            chat.updatedAt = tempMessage.createdAt
+            let replyToId = replyingTo?.messageId
+            replyingTo = nil
+            isShowingAttachmentPanel = false
+
+            do {
+                let response = try await APIClient.shared.sendGroupMessage(
+                    groupId: chat.chatId,
+                    senderId: currentUserId,
+                    senderName: UserDefaults.standard.string(forKey: "current_user_name"),
+                    encryptedContent: encrypted,
+                    replyToId: replyToId,
+                    extra: [
+                        "originalType": "text",
+                        "mlsEncrypted": true,
+                        "mlsEpoch": wire.epoch,
+                    ]
+                )
+                tempMessage.messageId = response.messageId ?? "\(chat.chatId):\(response.seq)"
+                tempMessage.createdAt = Date(milliseconds: response.timestamp)
+                tempMessage.status = "sent"
+                chat.updatedAt = tempMessage.createdAt
+                save(modelContext)
+            } catch {
+                tempMessage.status = "failed"
+                save(modelContext)
+                throw error
+            }
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -667,6 +877,10 @@ final class ChatDetailViewModel: ObservableObject {
             return peer
         }
         return chat.memberIds.first
+    }
+
+    private var groupEncryptionUnavailableMessage: String {
+        "这台 iPhone 尚未建立该群的 MLS 密钥，已阻止明文或私聊协议发送"
     }
 
     private func persistLocalMedia(data: Data, fileName: String) -> URL? {

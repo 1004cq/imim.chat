@@ -2,6 +2,15 @@ import Foundation
 import UIKit
 
 enum AvatarStore {
+    static func removeAccountAvatar(userId: String) {
+        guard !userId.isEmpty, !userId.contains("/"),
+              let directory = try? avatarDirectory(),
+              let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
+        for file in files where file.lastPathComponent.hasPrefix("avatar-\(userId)-") && file.pathExtension == "jpg" {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
     static func saveAvatar(_ image: UIImage, userId: String, replacing oldPath: String?) throws -> String {
         let directory = try avatarDirectory()
         let processedImage = image.normalizedForAvatar()

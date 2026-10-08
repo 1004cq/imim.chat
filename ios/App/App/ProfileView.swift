@@ -27,6 +27,7 @@ struct ProfileView: View {
                             DoveAvatar(
                                 name: currentUser?.nickname ?? "我",
                                 url: currentUser?.avatar,
+                                userId: currentUser?.id,
                                 size: 72
                             )
 
@@ -42,7 +43,7 @@ struct ProfileView: View {
                     .accessibilityLabel("修改头像")
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(currentUser?.nickname ?? "未登录")
+                        Text(currentUser?.nickname ?? AppLocalization.text("未登录"))
                             .font(.title3.bold())
                         Text(currentUser?.account ?? "")
                             .font(.subheadline)
@@ -60,7 +61,7 @@ struct ProfileView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         } else if let avatarStatusMessage {
-                            Text(avatarStatusMessage)
+                            AppLocalizedText(avatarStatusMessage)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -112,7 +113,7 @@ struct ProfileView: View {
         )) {
             Button("知道了", role: .cancel) {}
         } message: {
-            Text(avatarErrorMessage ?? "")
+            AppLocalizedText(avatarErrorMessage ?? "")
         }
         .onAppear {
             nickname = currentUser?.nickname ?? ""

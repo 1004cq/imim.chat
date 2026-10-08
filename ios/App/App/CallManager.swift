@@ -90,7 +90,7 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
     private var silentEndRequests: Set<UUID> = []
 
     private override init() {
-        let config = CXProviderConfiguration(localizedName: "imm")
+        let config = CXProviderConfiguration()
         config.ringtoneSound = "call_incoming.caf"
         config.supportsVideo = true
         config.maximumCallsPerCallGroup = 1

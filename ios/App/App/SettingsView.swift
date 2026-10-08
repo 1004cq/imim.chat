@@ -7,6 +7,7 @@ struct SettingsView: View {
     @EnvironmentObject private var authSession: AuthSession
     @EnvironmentObject private var pushManager: PushNotificationManager
     @AppStorage("isDarkMode") private var isDarkMode = false
+    @AppStorage(AppLanguage.preferenceKey) private var languagePreference = AppLanguage.system.rawValue
     @Query private var chats: [Chat]
 
     @State private var isShowingQRCode = false
@@ -16,36 +17,35 @@ struct SettingsView: View {
     }
 
     private var displayName: String {
-        currentUser?.nickname.isEmpty == false ? currentUser!.nickname : (currentUser?.account ?? "未登录")
+        guard let currentUser else { return "未登录" }
+        return currentUser.nickname.isEmpty ? currentUser.account : currentUser.nickname
     }
 
     private var fullAccountText: String {
+        let account = currentUser?.account.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !account.isEmpty { return account }
         let id = currentUser?.id.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !id.isEmpty { return id }
-        let account = currentUser?.account.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !account.isEmpty, account != "0" { return account }
         return UserDefaults.standard.string(forKey: "current_user_id") ?? "未绑定账号"
     }
 
     private var accountText: String {
-        let account = currentUser?.account.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !account.isEmpty, account.count <= 16, account != "0" { return "@\(account)" }
-        let id = fullAccountText
-        return id.count > 6 ? "ID · \(id.suffix(6))" : id
+        fullAccountText
     }
 
     var body: some View {
         ZStack {
             DoveTheme.paper.ignoresSafeArea()
+            DoveTheme.warmGray.opacity(0.22).ignoresSafeArea()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 20) {
                     profileHeader
                     settingsGroups
                 }
                 .padding(.horizontal, 18)
-                .padding(.top, 16)
-                .padding(.bottom, 28)
+                .padding(.top, 10)
+                .padding(.bottom, 32)
             }
         }
         .toolbar(.hidden, for: .navigationBar)
@@ -54,167 +54,208 @@ struct SettingsView: View {
                 QRCodeCardView(
                     title: displayName,
                     account: fullAccountText,
-                    avatar: currentUser?.avatar
+                    avatar: currentUser?.avatar,
+                    userId: currentUser?.id ?? ""
                 )
             }
         }
     }
 
     private var profileHeader: some View {
-        VStack(alignment: .leading, spacing: 24) {
+        VStack(alignment: .leading, spacing: 16) {
             Text("设置")
-                .font(.system(size: 34, weight: .semibold, design: .rounded))
+                .font(.system(size: 32, weight: .bold, design: .rounded))
                 .foregroundStyle(DoveTheme.ink)
 
-            HStack(spacing: 18) {
-                NavigationLink {
-                    ProfileView()
-                } label: {
-                    DoveAvatar(
-                        name: displayName,
-                        url: currentUser?.avatar,
-                        size: 82
-                    )
-                }
-                .buttonStyle(.plain)
+            VStack(spacing: 0) {
+                HStack(spacing: 14) {
+                    NavigationLink {
+                        ProfileView()
+                    } label: {
+                        HStack(spacing: 14) {
+                            DoveAvatar(
+                                name: displayName,
+                                url: currentUser?.avatar,
+                                userId: currentUser?.id,
+                                size: 68
+                            )
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(displayName)
-                        .font(.system(size: 28, weight: .semibold))
-                        .foregroundStyle(DoveTheme.ink)
-                        .lineLimit(1)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(displayName)
+                                    .font(.system(size: 22, weight: .bold))
+                                    .foregroundStyle(DoveTheme.ink)
+                                    .lineLimit(1)
 
-                    HStack(spacing: 6) {
-                        Text("账号：")
-                        Text(accountText)
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 12, weight: .semibold))
+                                HStack(spacing: 5) {
+                                    Text("账号")
+                                    Text(accountText)
+                                        .fontWeight(.medium)
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 10, weight: .bold))
+                                }
+                                .font(.system(size: 13))
+                                .foregroundStyle(DoveTheme.secondaryText)
+                            }
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
+                    .buttonStyle(SettingsPressButtonStyle())
+
+                    Spacer(minLength: 8)
+
+                    Button {
+                        isShowingQRCode = true
+                    } label: {
+                        Image(systemName: "qrcode")
+                            .font(.system(size: 19, weight: .semibold))
+                            .foregroundStyle(DoveTheme.ink.opacity(0.70))
+                            .frame(width: 42, height: 42)
+                            .background(DoveTheme.warmGray.opacity(0.66), in: Circle())
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                    .accessibilityLabel("打开我的二维码")
                 }
+                .padding(14)
 
-                Spacer()
+                Divider()
+                    .padding(.leading, 96)
 
-                Button {
-                    isShowingQRCode = true
-                } label: {
-                    Image(systemName: "qrcode")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 44, height: 44)
+                HStack(spacing: 8) {
+                    Image(systemName: "shield.checkered")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(DoveTheme.green)
+                        .frame(width: 26, height: 26)
+                        .background(DoveTheme.green.opacity(0.10), in: Circle())
+
+                    Text("端到端加密已启用")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(DoveTheme.ink.opacity(0.72))
+
+                    Spacer()
+
+                    Text("E2EE")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(DoveTheme.green)
                 }
-                .buttonStyle(.plain)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
             }
-
-            HStack {
-                Spacer()
-                Label("E2EE", systemImage: "shield.checkered")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(DoveTheme.green)
+            .background(DoveTheme.cardSurface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(DoveTheme.ink.opacity(0.07), lineWidth: 0.8)
             }
+            .shadow(color: .black.opacity(0.055), radius: 16, y: 6)
         }
     }
 
     private var settingsGroups: some View {
-        VStack(spacing: 22) {
-            SettingsCard {
-                NavigationLink {
-                    AccountSecurityPanel(account: fullAccountText)
-                } label: {
-                    SettingsRowContent(
-                        title: "账号与安全",
-                        subtitle: "密钥管理、安全号码、设备",
-                        systemImage: "shield",
-                        tint: DoveTheme.green
-                    )
-                }
-                .buttonStyle(.plain)
+        VStack(spacing: 20) {
+            SettingsSection(title: "账户") {
+                SettingsCard {
+                    NavigationLink {
+                        AccountSecurityPanel(account: fullAccountText)
+                    } label: {
+                        SettingsRowContent(
+                            title: "账号与安全",
+                            subtitle: "密钥、安全号码与设备",
+                            systemImage: "shield",
+                            tint: DoveTheme.green
+                        )
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
 
-                SettingsDivider()
+                    SettingsDivider()
 
-                SettingsRow(
-                    title: "我的二维码",
-                    systemImage: "qrcode",
-                    tint: Color(red: 0.86, green: 0.65, blue: 0.20)
-                ) {
-                    isShowingQRCode = true
+                    SettingsRow(
+                        title: "我的二维码",
+                        systemImage: "qrcode",
+                        tint: Color(red: 0.86, green: 0.65, blue: 0.20)
+                    ) {
+                        isShowingQRCode = true
+                    }
                 }
             }
 
-            SettingsCard {
-                NavigationLink {
-                    SavedChatsPanel()
-                } label: {
-                    SettingsRowContent(title: "收藏", systemImage: "bookmark", tint: .orange)
+            SettingsSection(title: "偏好设置") {
+                SettingsCard {
+                    NavigationLink {
+                        SavedChatsPanel()
+                    } label: {
+                        SettingsRowContent(title: "收藏", systemImage: "bookmark", tint: .orange)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                    SettingsDivider()
+                    NavigationLink {
+                        GeneralSettingsPanel()
+                    } label: {
+                        SettingsRowContent(title: "通用设置", systemImage: "gearshape", tint: .gray)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                    SettingsDivider()
+                    NavigationLink {
+                        NotificationSettingsPanel()
+                            .environmentObject(pushManager)
+                    } label: {
+                        SettingsRowContent(
+                            title: "消息通知",
+                            subtitle: pushManager.isSystemDeliveryReady ? "已开启" : "未开启",
+                            systemImage: "bell",
+                            tint: .red
+                        )
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                    SettingsDivider()
+                    NavigationLink {
+                        AppearanceSettingsPanel()
+                    } label: {
+                        SettingsRowContent(title: "外观", subtitle: isDarkMode ? "深色" : "浅色", systemImage: "paintpalette", tint: .purple)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
                 }
-                .buttonStyle(.plain)
-                SettingsDivider()
-                NavigationLink {
-                    GeneralSettingsPanel()
-                } label: {
-                    SettingsRowContent(title: "通用设置", systemImage: "gearshape", tint: .gray)
-                }
-                .buttonStyle(.plain)
-                SettingsDivider()
-                NavigationLink {
-                    NotificationSettingsPanel()
-                        .environmentObject(pushManager)
-                } label: {
-                    SettingsRowContent(
-                        title: "消息通知",
-                        subtitle: pushManager.isSystemDeliveryReady ? "已开启" : "未开启",
-                        systemImage: "bell",
-                        tint: .red
-                    )
-                }
-                .buttonStyle(.plain)
-                SettingsDivider()
-                NavigationLink {
-                    AppearanceSettingsPanel()
-                } label: {
-                    SettingsRowContent(title: "外观", subtitle: isDarkMode ? "深色" : "浅色", systemImage: "paintpalette", tint: .purple)
-                }
-                .buttonStyle(.plain)
             }
 
-            SettingsCard {
-                NavigationLink {
-                    StorageSettingsPanel()
-                } label: {
-                    SettingsRowContent(title: "存储空间", subtitle: cacheSizeText, systemImage: "externaldrive", tint: DoveTheme.green)
+            SettingsSection(title: "数据与隐私") {
+                SettingsCard {
+                    NavigationLink {
+                        StorageSettingsPanel()
+                    } label: {
+                        SettingsRowContent(title: "存储空间", subtitle: cacheSizeText, systemImage: "externaldrive", tint: DoveTheme.green)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                    SettingsDivider()
+                    NavigationLink {
+                        LanguageSettingsPanel()
+                    } label: {
+                        SettingsRowContent(title: "语言", subtitle: (AppLanguage(rawValue: languagePreference) ?? .system).displayName, systemImage: "globe", tint: .teal)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                    SettingsDivider()
+                    NavigationLink {
+                        PrivacySettingsPanel()
+                    } label: {
+                        SettingsRowContent(title: "隐私", systemImage: "lock", tint: .pink)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
                 }
-                .buttonStyle(.plain)
-                SettingsDivider()
-                NavigationLink {
-                    LanguageSettingsPanel()
-                } label: {
-                    SettingsRowContent(title: "语言", subtitle: "简体中文", systemImage: "globe", tint: .teal)
-                }
-                .buttonStyle(.plain)
-                SettingsDivider()
-                NavigationLink {
-                    PrivacySettingsPanel()
-                } label: {
-                    SettingsRowContent(title: "隐私", systemImage: "lock", tint: .pink)
-                }
-                .buttonStyle(.plain)
             }
 
-            SettingsCard {
-                NavigationLink {
-                    HelpAndFeedbackPanel()
-                } label: {
-                    SettingsRowContent(title: "帮助与反馈", systemImage: "questionmark.circle", tint: DoveTheme.green)
+            SettingsSection(title: "支持") {
+                SettingsCard {
+                    NavigationLink {
+                        HelpAndFeedbackPanel()
+                    } label: {
+                        SettingsRowContent(title: "帮助与反馈", systemImage: "questionmark.circle", tint: DoveTheme.green)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                    SettingsDivider()
+                    NavigationLink {
+                        AboutSettingsPanel()
+                    } label: {
+                        SettingsRowContent(title: "关于 IMIM Chat", subtitle: appVersion, systemImage: "info.circle", tint: DoveTheme.green)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
                 }
-                .buttonStyle(.plain)
-                SettingsDivider()
-                NavigationLink {
-                    AboutSettingsPanel()
-                } label: {
-                    SettingsRowContent(title: "关于 IMIM Chat", subtitle: appVersion, systemImage: "info.circle", tint: DoveTheme.green)
-                }
-                .buttonStyle(.plain)
             }
 
             Button(role: .destructive) {
@@ -224,8 +265,13 @@ struct SettingsView: View {
                     .font(.system(size: 16, weight: .semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
-                    .background(.white.opacity(0.92), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(Color.red.opacity(0.12), lineWidth: 0.8)
+                    }
             }
+            .buttonStyle(SettingsPressButtonStyle())
         }
     }
 
@@ -239,6 +285,22 @@ struct SettingsView: View {
     }
 }
 
+private struct SettingsSection<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            AppLocalizedText(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(DoveTheme.secondaryText)
+                .padding(.leading, 6)
+
+            content
+        }
+    }
+}
+
 private struct SettingsCard<Content: View>: View {
     @ViewBuilder let content: Content
 
@@ -246,8 +308,12 @@ private struct SettingsCard<Content: View>: View {
         VStack(spacing: 0) {
             content
         }
-        .background(DoveTheme.cardSurface.opacity(0.92), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .shadow(color: .black.opacity(0.035), radius: 18, y: 8)
+        .background(DoveTheme.cardSurface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(DoveTheme.ink.opacity(0.065), lineWidth: 0.8)
+        }
+        .shadow(color: .black.opacity(0.045), radius: 14, y: 5)
     }
 }
 
@@ -262,7 +328,7 @@ private struct SettingsRow: View {
         Button(action: action) {
             SettingsRowContent(title: title, subtitle: subtitle, systemImage: systemImage, tint: tint)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SettingsPressButtonStyle())
     }
 }
 
@@ -273,21 +339,21 @@ private struct SettingsRowContent: View {
     let tint: Color
 
     var body: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 14) {
             Image(systemName: systemImage)
-                .font(.system(size: 20, weight: .semibold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(tint)
-                .frame(width: 40, height: 40)
+                .frame(width: 38, height: 38)
                 .background(tint.opacity(0.12), in: Circle())
 
-            Text(title)
-                .font(.system(size: 18, weight: .medium))
+            AppLocalizedText(title)
+                .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(DoveTheme.ink)
 
             Spacer()
 
             if let subtitle {
-                Text(subtitle)
+                AppLocalizedText(subtitle)
                     .font(.system(size: 14))
                     .foregroundStyle(.secondary.opacity(0.75))
                     .lineLimit(1)
@@ -297,8 +363,9 @@ private struct SettingsRowContent: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.secondary.opacity(0.45))
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 17)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .frame(minHeight: 64)
         .contentShape(Rectangle())
     }
 }
@@ -306,7 +373,16 @@ private struct SettingsRowContent: View {
 private struct SettingsDivider: View {
     var body: some View {
         Divider()
-            .padding(.leading, 74)
+            .padding(.leading, 68)
+    }
+}
+
+private struct SettingsPressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .opacity(configuration.isPressed ? 0.72 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
@@ -347,7 +423,7 @@ private struct SavedChatsPanel: View {
     @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
 
     private var pinnedChats: [Chat] {
-        chats.filter(\.isPinned)
+        chats.filter { $0.isPinned && !$0.isBuiltinSystemConversation }
     }
 
     var body: some View {
@@ -364,7 +440,7 @@ private struct SavedChatsPanel: View {
                         ChatDetailView(chat: chat)
                     } label: {
                         HStack(spacing: 12) {
-                            DoveAvatar(name: chat.name, url: chat.avatar, size: 42, isGroup: chat.type == "group")
+                            DoveAvatar(name: chat.name, url: chat.avatar, userId: chat.avatarPeerUserId, size: 42, isGroup: chat.type == "group")
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(chat.name)
                                     .foregroundStyle(DoveTheme.ink)
@@ -395,7 +471,7 @@ private struct StorageSettingsPanel: View {
     }
 
     private var cacheSizeText: String {
-        messageCount == 0 ? "0 MB" : "约 \(max(1, messageCount / 8)) MB"
+        messageCount == 0 ? "0 MB" : AppLocalization.text("约 \(max(1, messageCount / 8)) MB")
     }
 
     var body: some View {
@@ -403,7 +479,7 @@ private struct StorageSettingsPanel: View {
             Section {
                 LabeledContent("会话") { Text("\(chats.count)") }
                 LabeledContent("消息") { Text("\(messageCount)") }
-                LabeledContent("估算占用") { Text(cacheSizeText) }
+                LabeledContent("估算占用") { AppLocalizedText(cacheSizeText) }
             } header: {
                 Text("本机缓存")
             } footer: {
@@ -428,6 +504,7 @@ private struct StorageSettingsPanel: View {
 
     private func clearChatCache() {
         for chat in chats {
+            guard !chat.isBuiltinSystemConversation else { continue }
             modelContext.delete(chat)
         }
         try? modelContext.save()
@@ -435,19 +512,34 @@ private struct StorageSettingsPanel: View {
 }
 
 private struct LanguageSettingsPanel: View {
+    @AppStorage(AppLanguage.preferenceKey) private var languagePreference = AppLanguage.system.rawValue
+
     var body: some View {
         List {
             Section {
-                HStack {
-                    Text("当前语言")
-                    Spacer()
-                    Text("简体中文")
-                        .foregroundStyle(.secondary)
+                ForEach(AppLanguage.allCases) { language in
+                    Button {
+                        languagePreference = language.rawValue
+                    } label: {
+                        HStack {
+                            Text(verbatim: language.displayName)
+                                .foregroundStyle(DoveTheme.ink)
+                            Spacer()
+                            if languagePreference == language.rawValue {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(DoveTheme.green)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("language.\(language.rawValue)")
+                    .accessibilityAddTraits(languagePreference == language.rawValue ? .isSelected : [])
                 }
             } header: {
                 Text("应用语言")
             } footer: {
-                Text("当前原生客户端已完整适配简体中文；系统语言变化不会破坏聊天和加密内容的显示。")
+                Text("切换后立即生效，仅更改界面语言，不会翻译聊天内容或改变加密会话。")
             }
         }
         .navigationTitle("语言")
@@ -513,7 +605,7 @@ private struct AccountSecurityPanel: View {
 
             Section {
                 NavigationLink { KeyManagementPanel(diagnostics: diagnostics) } label: {
-                    securityRow("密钥管理", detail: diagnostics.map { "\($0.availablePreKeyCount) 个 PreKeys" } ?? "正在读取", icon: "key.fill", tint: .green)
+                    securityRow("密钥管理", detail: diagnostics.map { AppLocalization.text("\($0.availablePreKeyCount) 个 PreKeys") } ?? AppLocalization.string("正在读取"), icon: "key.fill", tint: .green)
                 }
                 NavigationLink { SafetyNumberPanel(diagnostics: diagnostics) } label: {
                     securityRow("安全号码", detail: "验证本机身份指纹", icon: "number.square.fill", tint: .blue)
@@ -526,6 +618,17 @@ private struct AccountSecurityPanel: View {
                 }
             } header: {
                 Text("安全")
+            }
+            Section {
+                NavigationLink {
+                    AccountDeletionPanel(account: account)
+                } label: {
+                    Label("注销账号", systemImage: "person.crop.circle.badge.minus")
+                        .foregroundStyle(.red)
+                }
+                .accessibilityIdentifier("account.delete.entry")
+            } footer: {
+                Text("注销会永久删除账号，不是退出登录。")
             }
         }
         .navigationTitle("账号与安全")
@@ -542,15 +645,112 @@ private struct AccountSecurityPanel: View {
                 .foregroundStyle(.white)
                 .frame(width: 32, height: 32)
                 .background(tint, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            Text(title)
+            AppLocalizedText(title)
                 .foregroundStyle(DoveTheme.ink)
             Spacer()
-            Text(detail)
+            AppLocalizedText(detail)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
     }
+}
+
+private struct AccountDeletionPanel: View {
+    let account: String
+    @EnvironmentObject private var authSession: AuthSession
+    @Environment(\.modelContext) private var modelContext
+    @State private var password = ""
+    @State private var acknowledged = false
+    @State private var confirming = false
+    @State private var error: String?
+    @FocusState private var passwordFocused: Bool
+
+    init(account: String, initialError: String? = nil) {
+        self.account = account
+        _error = State(initialValue: initialError)
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Label("永久注销账号", systemImage: "exclamationmark.triangle")
+                    .font(.headline).foregroundStyle(.red)
+                LabeledContent("当前账号", value: account)
+                Text("注销后无法恢复账号、好友关系、朋友圈和服务器保存的本人发送内容。所有设备的登录凭证将失效。")
+                    .foregroundStyle(.secondary)
+                Text("其他用户已下载或保存的副本不会自动撤回。媒体原文件在后台清理；自己创建的群聊请先转让或解散。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Section {
+                SecureField("输入当前账号密码", text: $password)
+                    .textContentType(.password)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($passwordFocused)
+                    .accessibilityIdentifier("account.delete.password")
+            } header: {
+                Text("验证身份")
+            } footer: {
+                Text("仅用于本次身份验证，不会保存密码。忘记密码可先在登录页重置密码。")
+            }
+            Section {
+                Toggle("我已了解注销后无法恢复", isOn: $acknowledged)
+                    .tint(.red)
+                Button(role: .destructive) {
+                    passwordFocused = false
+                    confirming = true
+                } label: {
+                    HStack {
+                        Text(authSession.isDeletingAccount ? AppLocalization.text("正在注销…") : AppLocalization.text("注销账号"))
+                        Spacer()
+                        if authSession.isDeletingAccount { ProgressView() }
+                    }
+                }
+                .disabled(password.isEmpty || !acknowledged || authSession.isDeletingAccount)
+                .accessibilityIdentifier("account.delete.submit")
+                if let error {
+                    AppLocalizedText(error).foregroundStyle(.red).font(.footnote)
+                }
+            }
+        }
+        .disabled(authSession.isDeletingAccount)
+        .navigationTitle("注销账号")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(authSession.isDeletingAccount)
+        .scrollDismissesKeyboard(.interactively)
+        .alert("确认永久注销账号？", isPresented: $confirming) {
+            Button("取消", role: .cancel) {}
+            Button("确认注销", role: .destructive) {
+                // Explicit user action: not tied to view appearance/cancellation.
+                Task {
+                    error = nil
+                    do {
+                        try await authSession.deleteAccount(password: password, context: modelContext)
+                        password = ""
+                    } catch {
+                        self.error = error.localizedDescription
+                    }
+                }
+            }
+        } message: {
+            Text("即将永久注销 \(account)。这项操作无法撤销。")
+        }
+    }
+}
+
+#Preview("注销账号 · 确认前") {
+    NavigationStack { AccountDeletionPanel(account: "preview_user").disabled(true) }
+        .environmentObject(AuthSession(userDefaults: UserDefaults(suiteName: "imim.account-delete.preview")!))
+        .modelContainer(for: [User.self, Chat.self, Message.self], inMemory: true)
+}
+
+#Preview("注销账号 · 验证失败") {
+    NavigationStack {
+        AccountDeletionPanel(account: "preview_user", initialError: "密码不正确，账号未注销").disabled(true)
+    }
+    .environmentObject(AuthSession(userDefaults: UserDefaults(suiteName: "imim.account-delete.preview")!))
+    .modelContainer(for: [User.self, Chat.self, Message.self], inMemory: true)
 }
 
 private struct KeyManagementPanel: View {
@@ -559,11 +759,11 @@ private struct KeyManagementPanel: View {
     var body: some View {
         List {
             Section {
-                LabeledContent("Registration ID") { Text(diagnostics.map { "\($0.registrationId)" } ?? "未初始化") }
+                LabeledContent("Registration ID") { Text(diagnostics.map { "\($0.registrationId)" } ?? AppLocalization.text("未初始化")) }
                 LabeledContent("可用 PreKeys") { Text(diagnostics.map { "\($0.availablePreKeyCount)" } ?? "-") }
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Identity Key 指纹")
-                    Text(diagnostics?.identityFingerprint ?? "未初始化")
+                    Text(diagnostics?.identityFingerprint ?? AppLocalization.text("未初始化"))
                         .font(.system(.footnote, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -585,7 +785,7 @@ private struct SafetyNumberPanel: View {
     var body: some View {
         List {
             Section {
-                Text(diagnostics?.identityFingerprint ?? "尚未初始化加密身份")
+                Text(diagnostics?.identityFingerprint ?? AppLocalization.text("尚未初始化加密身份"))
                     .font(.system(.body, design: .monospaced))
                     .textSelection(.enabled)
                 Button("复制安全号码") {
@@ -607,7 +807,7 @@ private struct DeviceManagementPanel: View {
     let account: String
 
     private var deviceName: String { UIDevice.current.name }
-    private var deviceDetail: String { "iOS \(UIDevice.current.systemVersion) · 当前设备" }
+    private var deviceDetail: String { AppLocalization.text("iOS \(UIDevice.current.systemVersion) · 当前设备") }
 
     var body: some View {
         List {
@@ -615,7 +815,7 @@ private struct DeviceManagementPanel: View {
                 Label {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(deviceName)
-                        Text(deviceDetail)
+                        AppLocalizedText(deviceDetail)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -836,7 +1036,7 @@ private struct NotificationSettingsPanel: View {
     @ViewBuilder
     private func notificationSection<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(title)
+            AppLocalizedText(title)
                 .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 8)
@@ -866,11 +1066,11 @@ private struct NotificationToggleRow: View {
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+                AppLocalizedText(title)
                     .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(DoveTheme.ink)
                 if let detail {
-                    Text(detail)
+                    AppLocalizedText(detail)
                         .font(.system(size: 13))
                         .foregroundStyle(.secondary)
                 }
@@ -899,6 +1099,11 @@ private struct QRCodeCardView: View {
     let title: String
     let account: String
     let avatar: String?
+    let userId: String
+
+    private var qrPayload: String {
+        QRCodeGenerator.userPayload(userId: userId)
+    }
 
     var body: some View {
         VStack(spacing: 24) {
@@ -907,19 +1112,32 @@ private struct QRCodeCardView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title)
                         .font(.title3.bold())
-                    Text(account)
+                    Text("账号：\(account)")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
             }
 
-            Image(systemName: "qrcode")
-                .font(.system(size: 190, weight: .regular))
-                .foregroundStyle(DoveTheme.ink)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 28)
-                .background(DoveTheme.paper, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            Group {
+                if let image = QRCodeGenerator.makeImage(from: qrPayload), !userId.isEmpty {
+                    Image(uiImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .scaledToFit()
+                        .accessibilityLabel("\(title) 的好友二维码")
+                } else {
+                    ContentUnavailableView(
+                        "二维码生成失败",
+                        systemImage: "qrcode",
+                        description: Text("请重新登录后再试。")
+                    )
+                }
+            }
+            .frame(width: 236, height: 236)
+            .padding(16)
+            .background(.white, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .shadow(color: .black.opacity(0.08), radius: 18, y: 8)
 
             Text("扫一扫上面的二维码，加我为好友")
                 .font(.footnote)

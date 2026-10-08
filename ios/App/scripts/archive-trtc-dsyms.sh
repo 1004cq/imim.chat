@@ -11,6 +11,13 @@ fi
 sdk_root="${SRCROOT}/Packages/TRTC/Binaries"
 destination="${DWARF_DSYM_FOLDER_PATH}"
 
+# App.xcworkspace links TRTC through CocoaPods. Do not copy dSYMs from the
+# retired local Swift package: those binaries can be a different SDK version.
+if [ -d "${PODS_ROOT:-}/TXLiteAVSDK_TRTC" ]; then
+  echo "TRTC is provided by CocoaPods; skipping local-package dSYM copy"
+  exit 0
+fi
+
 for framework in TXLiteAVSDK_Professional TXFFmpeg TXSoundTouch; do
   source="${sdk_root}/${framework}.xcframework/ios-arm64_armv7/${framework}.framework.dSYM"
   target="${destination}/${framework}.framework.dSYM"

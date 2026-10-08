@@ -5,18 +5,23 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// The native Moments feed deliberately follows the dark web layout while using the same API data.
+/// Native Moments keeps the web feed's quiet, edge-to-edge timeline while
+/// preserving native loading, publishing and media viewing behavior.
 struct DiscoveryView: View {
     @AppStorage("isDarkMode") private var isDarkMode = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var viewModel = MomentsFeedViewModel()
     @State private var isShowingComposer = false
     @State private var isShowingCoverActions = false
     @State private var selectedCoverSource: ImagePickerView.Source?
     @State private var coverPreview: UIImage?
     @State private var coverURL = ""
-    @State private var profileSignature: String?
+    @State private var profileName: String?
+    @State private var profileAvatar: String?
     @State private var isUploadingCover = false
     @State private var coverUploadError: String?
+    @State private var coverProfileError: String?
+    @State private var coverReloadID = UUID()
 
     var body: some View {
         ZStack {
@@ -29,8 +34,11 @@ struct DiscoveryView: View {
                 }
                 .padding(.bottom, 28)
             }
+            .scrollIndicators(.hidden)
             .refreshable {
-                await viewModel.refresh()
+                async let feed: Void = viewModel.refresh()
+                async let profile: Void = refreshProfileCover()
+                _ = await (feed, profile)
             }
         }
         .toolbar(.hidden, for: .navigationBar)
@@ -39,6 +47,9 @@ struct DiscoveryView: View {
             async let feed: Void = viewModel.loadIfNeeded()
             async let profile: Void = refreshProfileCover()
             _ = await (feed, profile)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cqimProfileDidChange)) { _ in
+            Task { await refreshProfileCover() }
         }
         .confirmationDialog("朋友圈", isPresented: $isShowingCoverActions, titleVisibility: .visible) {
             Button("发布动态") {
@@ -74,81 +85,98 @@ struct DiscoveryView: View {
         )) {
             Button("好", role: .cancel) {}
         } message: {
-            Text(coverUploadError ?? "请稍后重试")
+            Text(coverUploadError ?? AppLocalization.text("请稍后重试"))
         }
         .preferredColorScheme(isDarkMode ? .dark : .light)
     }
 
     private var profileCover: some View {
-        let name = nonBlank(UserDefaults.standard.string(forKey: "current_user_name")) ?? "IMIM"
-        let avatar = UserDefaults.standard.string(forKey: "current_user_avatar")
-        let signature = profileSignature
-            ?? nonBlank(UserDefaults.standard.string(forKey: "current_user_bio"))
-            ?? "记录此刻的心情"
+        let name = profileName
+            ?? nonBlank(UserDefaults.standard.string(forKey: "current_user_name"))
+            ?? nonBlank(UserDefaults.standard.string(forKey: "current_user_account"))
+            ?? "IMIM"
+        let avatar = profileAvatar ?? UserDefaults.standard.string(forKey: "current_user_avatar")
 
-        return ZStack(alignment: .bottomTrailing) {
-            coverImage
-                .frame(height: 290)
-                .clipped()
-                .overlay(
+        return ZStack(alignment: .bottom) {
+            GeometryReader { geometry in
+                coverImage
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .clipped()
+            }
+                .frame(height: 226)
+                .overlay {
                     LinearGradient(
-                        colors: [.clear, Color.black.opacity(0.76)],
-                        startPoint: .center,
+                        colors: [Color.black.opacity(0.06), Color.black.opacity(0.40)],
+                        startPoint: .top,
                         endPoint: .bottom
                     )
-                )
-
-            HStack {
-                Text("朋友圈")
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundStyle(.white)
-                    .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
-
-                Spacer()
-
-                Button {
-                    isShowingCoverActions = true
-                } label: {
-                    ZStack {
-                        Circle().fill(.black.opacity(0.24))
-                        if isUploadingCover {
-                            ProgressView().tint(.white)
-                        } else {
-                            Image(systemName: "camera.fill")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundStyle(.white)
-                        }
-                    }
-                    .frame(width: 42, height: 42)
                 }
-                .buttonStyle(.plain)
-                .disabled(isUploadingCover)
-            }
-            .frame(maxHeight: .infinity, alignment: .top)
-            .padding(.horizontal, 18)
-            .padding(.top, 18)
+                .overlay(alignment: .top) {
+                    HStack {
+                        Text("朋友圈")
+                            .font(.system(size: 19, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.32), radius: 4, y: 2)
 
-            VStack(alignment: .trailing, spacing: 4) {
+                        Spacer()
+
+                        Button {
+                            isShowingComposer = true
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 25, weight: .medium))
+                                .foregroundStyle(.white)
+                                .frame(width: 42, height: 42)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("发布朋友圈")
+
+                        Button {
+                            isShowingCoverActions = true
+                        } label: {
+                            if isUploadingCover {
+                                ProgressView().tint(.white)
+                                    .frame(width: 42, height: 42)
+                            } else {
+                                Image(systemName: "camera")
+                                    .font(.system(size: 21, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 42, height: 42)
+                                    .contentShape(Rectangle())
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isUploadingCover)
+                        .accessibilityLabel("更换朋友圈封面")
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 14)
+                }
+
+            HStack(alignment: .bottom, spacing: 11) {
+                Spacer(minLength: 8)
+
                 Text(name)
-                    .font(.system(size: 22, weight: .bold))
+                    .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(.white)
-                    .shadow(color: .black.opacity(0.7), radius: 4, y: 2)
-                Text(signature)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.white.opacity(0.78))
                     .lineLimit(1)
-            }
-            .padding(.trailing, 116)
-            .padding(.bottom, 18)
+                    .shadow(color: .black.opacity(0.48), radius: 3, y: 1)
+                    .padding(.bottom, 8)
 
-            MomentAvatar(name: name, url: avatar, size: 86)
-                .overlay(Circle().stroke(.white, lineWidth: 3))
-                .shadow(color: .black.opacity(0.55), radius: 9, y: 4)
-                .padding(.trailing, 18)
-                .offset(y: 38)
+                MomentAvatar(name: name, url: avatar, userId: UserDefaults.standard.string(forKey: "current_user_id"),
+                             size: 68, allowsSourceUpdates: true)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(Color.white, lineWidth: 3)
+                    }
+                    .shadow(color: .black.opacity(0.24), radius: 8, y: 4)
+                    .offset(y: 32)
+            }
+            .padding(.trailing, 18)
         }
-        .frame(height: 290)
-        .padding(.bottom, 48)
+        .frame(height: 226)
+        .padding(.bottom, 46)
     }
 
     @ViewBuilder
@@ -158,30 +186,89 @@ struct DiscoveryView: View {
                 .resizable()
                 .scaledToFill()
         } else if let url = momentURL(coverURL) {
-            AsyncImage(url: url) { phase in
+            AsyncImage(
+                url: url,
+                transaction: Transaction(animation: reduceMotion ? nil : .easeOut(duration: 0.28))
+            ) { phase in
                 switch phase {
                 case .success(let image):
-                    image.resizable().scaledToFill()
-                default:
-                    defaultCover
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .transition(.opacity)
+                case .failure:
+                    coverFailure
+                case .empty:
+                    coverLoading
+                @unknown default:
+                    coverFailure
                 }
             }
+            .id(coverReloadID)
         } else {
-            defaultCover
+            if coverProfileError != nil {
+                coverFailure
+            } else {
+                defaultCover
+            }
         }
     }
 
+    private var coverLoading: some View {
+        defaultCover
+            .overlay {
+                ProgressView()
+                    .tint(.white.opacity(0.8))
+                    .accessibilityLabel("正在加载封面")
+            }
+    }
+
+    private var coverFailure: some View {
+        defaultCover
+            .overlay(alignment: .bottomLeading) {
+                Button {
+                    coverReloadID = UUID()
+                    Task { await refreshProfileCover() }
+                } label: {
+                    Label("封面加载失败，点按重试", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.86))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.black.opacity(0.24), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 18)
+                .padding(.bottom, 18)
+            }
+    }
+
     private var defaultCover: some View {
-        LinearGradient(
-            colors: [MomentsPalette.coverGreen, Color.black.opacity(0.92)],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-        .overlay(alignment: .bottomLeading) {
-            Image(systemName: "photo.on.rectangle.angled")
-                .font(.system(size: 44, weight: .thin))
-                .foregroundStyle(.white.opacity(0.14))
-                .padding(24)
+        ZStack {
+            LinearGradient(
+                colors: [MomentsPalette.coverSlate, MomentsPalette.coverCharcoal],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+
+            RadialGradient(
+                colors: [.white.opacity(0.18), .clear],
+                center: .topLeading,
+                startRadius: 4,
+                endRadius: 240
+            )
+
+            RadialGradient(
+                colors: [MomentsPalette.accent.opacity(0.13), .clear],
+                center: .bottomTrailing,
+                startRadius: 10,
+                endRadius: 260
+            )
+
+            Image(systemName: "sparkles")
+                .font(.system(size: 40, weight: .ultraLight))
+                .foregroundStyle(.white.opacity(0.12))
+                .offset(x: 118, y: 42)
         }
     }
 
@@ -195,11 +282,24 @@ struct DiscoveryView: View {
     }
 
     private func refreshProfileCover() async {
-        guard let profile = try? await APIClient.shared.fetchCurrentProfile() else { return }
-        profileSignature = nonBlank(profile.bio)
-        guard let backgroundURL = nonBlank(profile.backgroundUrl) else { return }
-        coverURL = backgroundURL
-        UserDefaults.standard.set(backgroundURL, forKey: coverDefaultsKey)
+        guard !isUploadingCover else { return }
+        do {
+            let profile = try await APIClient.shared.fetchCurrentProfile()
+            guard !Task.isCancelled, !isUploadingCover else { return }
+            profileName = nonBlank(profile.nickname) ?? nonBlank(profile.name) ?? nonBlank(profile.id)
+            profileAvatar = nonBlank(profile.avatar)
+            AvatarImageLoader.shared.prefetch([.init(userId: profile.id, urlString: momentAvatarSource(profileAvatar))])
+            if let profileName { UserDefaults.standard.set(profileName, forKey: "current_user_name") }
+            if let profileAvatar { UserDefaults.standard.set(profileAvatar, forKey: "current_user_avatar") }
+            coverProfileError = nil
+            // Empty is authoritative too: a cover removed on Web must not
+            // reappear from this installation's cached URL.
+            coverURL = nonBlank(profile.backgroundUrl) ?? ""
+            UserDefaults.standard.set(coverURL, forKey: coverDefaultsKey)
+        } catch {
+            guard !Task.isCancelled else { return }
+            coverProfileError = error.localizedDescription
+        }
     }
 
     private func updateCover(with image: UIImage) {
@@ -220,8 +320,10 @@ struct DiscoveryView: View {
                 )
                 try await APIClient.shared.updateMomentCover(backgroundURL: uploaded.url)
                 coverURL = uploaded.url
+                coverProfileError = nil
                 UserDefaults.standard.set(uploaded.url, forKey: coverDefaultsKey)
                 coverPreview = nil
+                coverReloadID = UUID()
             } catch {
                 coverUploadError = error.localizedDescription
             }
@@ -231,6 +333,8 @@ struct DiscoveryView: View {
     private func resetCover() {
         coverPreview = nil
         coverURL = ""
+        coverProfileError = nil
+        coverReloadID = UUID()
         UserDefaults.standard.removeObject(forKey: coverDefaultsKey)
         Task {
             do {
@@ -243,6 +347,7 @@ struct DiscoveryView: View {
 
     @ViewBuilder
     private var feed: some View {
+        let shouldReduceMotion = reduceMotion
         if viewModel.isLoading && viewModel.moments.isEmpty {
             loadingView
         } else if let errorMessage = viewModel.errorMessage, viewModel.moments.isEmpty {
@@ -258,10 +363,11 @@ struct DiscoveryView: View {
                         try? await viewModel.comment(on: moment.id, content: content)
                     }
                 }
-                Divider()
-                    .overlay(MomentsPalette.divider)
-                    .padding(.leading, 74)
-                    .padding(.trailing, 18)
+                .scrollTransition(.interactive, axis: .vertical) { content, phase in
+                    content
+                        .opacity(phase.isIdentity || shouldReduceMotion ? 1 : 0.90)
+                        .scaleEffect(phase.isIdentity || shouldReduceMotion ? 1 : 0.985)
+                }
             }
 
             if viewModel.hasMore {
@@ -315,7 +421,7 @@ struct DiscoveryView: View {
 
     private func errorView(_ message: String) -> some View {
         VStack(spacing: 12) {
-            Text(message)
+            AppLocalizedText(message)
                 .font(.system(size: 14))
                 .foregroundStyle(.red.opacity(0.9))
                 .multilineTextAlignment(.center)
@@ -358,6 +464,7 @@ private final class MomentsFeedViewModel: ObservableObject {
         do {
             let response = try await APIClient.shared.fetchMomentsFeed()
             moments = response.moments
+            prefetchAvatars(response.moments)
             nextCursor = response.nextCursor
             hasMore = response.hasMore ?? false
         } catch {
@@ -374,6 +481,7 @@ private final class MomentsFeedViewModel: ObservableObject {
             let response = try await APIClient.shared.fetchMomentsFeed(cursor: nextCursor)
             let existing = Set(moments.map(\.id))
             moments.append(contentsOf: response.moments.filter { !existing.contains($0.id) })
+            prefetchAvatars(response.moments)
             nextCursor = response.nextCursor
             hasMore = response.hasMore ?? false
         } catch {
@@ -399,6 +507,12 @@ private final class MomentsFeedViewModel: ObservableObject {
                 errorMessage = "点赞失败：\(error.localizedDescription)"
             }
         }
+    }
+
+    private func prefetchAvatars(_ items: [MomentFeedItem]) {
+        AvatarImageLoader.shared.prefetch(items.map {
+            .init(userId: $0.authorId, urlString: momentAvatarSource($0.authorAvatar))
+        }, allowsSourceUpdates: false)
     }
 
     func publish(content: String, media: [MomentUploadSelection] = []) async throws {
@@ -441,25 +555,22 @@ private struct MomentFeedRow: View {
     @State private var commentText = ""
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            MomentAvatar(name: moment.authorName, url: moment.authorAvatar, size: 42)
+        HStack(alignment: .top, spacing: 8) {
+            MomentAvatar(name: moment.authorName, url: moment.authorAvatar, userId: moment.authorId, size: 40)
 
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 9) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(moment.authorName.isEmpty ? "IMIM 用户" : moment.authorName)
-                        .font(.system(size: 17, weight: .semibold))
+                    Text(moment.authorName.isEmpty ? AppLocalization.text("IMIM 用户") : moment.authorName)
+                        .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(MomentsPalette.authorBlue)
+                        .lineLimit(1)
 
-                    Spacer(minLength: 8)
-
-                    Text(moment.createdAt.darkMomentTimeText)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(MomentsPalette.tertiaryText)
+                    Spacer(minLength: 0)
                 }
 
                 if !moment.content.isEmpty {
                     Text(moment.content)
-                        .font(.system(size: 15))
+                        .font(.system(size: 14))
                         .foregroundStyle(MomentsPalette.primaryText)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -468,8 +579,33 @@ private struct MomentFeedRow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .clipped()
 
-                HStack {
-                    HStack(spacing: 16) {
+                HStack(spacing: 10) {
+                    Text(moment.createdAt.momentDateText)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(MomentsPalette.tertiaryText)
+
+                    Spacer(minLength: 8)
+
+                    Menu {
+                        Button(moment.isLiked ? AppLocalization.text("取消赞") : AppLocalization.text("赞"), action: onToggleLike)
+                        Button("评论") {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                isComposingComment = true
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(MomentsPalette.authorBlue)
+                            .frame(width: 36, height: 28)
+                            .background(MomentsPalette.actionBackground, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if moment.likeCount > 0 || moment.commentCount > 0 || !moment.comments.isEmpty {
+                    VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 14) {
                         Button {
                             withAnimation(.spring(response: 0.26, dampingFraction: 0.48)) {
                                 likePulse = true
@@ -480,8 +616,9 @@ private struct MomentFeedRow: View {
                             }
                         } label: {
                             Label("\(moment.likeCount)", systemImage: moment.isLiked ? "heart.fill" : "heart")
-                                .foregroundStyle(moment.isLiked ? MomentsPalette.like : MomentsPalette.secondaryText)
-                                .scaleEffect(likePulse ? 1.25 : 1)
+                                .foregroundStyle(moment.isLiked ? MomentsPalette.like : MomentsPalette.authorBlue)
+                                .scaleEffect(likePulse ? 1.15 : 1)
+                                .contentTransition(.numericText())
                         }
                         .buttonStyle(.plain)
 
@@ -491,39 +628,41 @@ private struct MomentFeedRow: View {
                             }
                         } label: {
                             Label("\(moment.commentCount)", systemImage: "bubble.left")
-                                .foregroundStyle(MomentsPalette.secondaryText)
+                                .foregroundStyle(MomentsPalette.authorBlue)
+                                .contentTransition(.numericText())
                         }
                         .buttonStyle(.plain)
+
+                        Spacer()
                     }
-
-                    Spacer(minLength: 8)
-
-                    Menu {
-                        Button(moment.isLiked ? "取消赞" : "赞", action: onToggleLike)
-                        Button("评论") {
-                            withAnimation(.easeInOut(duration: 0.18)) {
-                                isComposingComment = true
+                    .font(.system(size: 13, weight: .medium))
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    if !moment.comments.isEmpty {
+                        Divider().padding(.horizontal, 10)
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(moment.comments) { comment in
+                                commentTextView(comment)
+                                    .font(.system(size: 13))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
-                    } label: {
-                        Image(systemName: "ellipsis")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundStyle(MomentsPalette.secondaryText)
-                            .frame(width: 38, height: 28)
-                            .background(MomentsPalette.actionBackground, in: Capsule())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
                     }
-                    .buttonStyle(.plain)
+                    }
+                    .background(MomentsPalette.actionBackground, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
                 }
-                .font(.system(size: 13, weight: .medium))
 
                 if isComposingComment {
                     HStack(spacing: 8) {
                         TextField("写下你的评论", text: $commentText)
                             .font(.system(size: 14))
                             .foregroundStyle(MomentsPalette.primaryText)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .background(MomentsPalette.actionBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .padding(.horizontal, 11)
+                            .frame(height: 38)
+                            .background(MomentsPalette.actionBackground, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
 
                         Button("发送") {
                             let content = commentText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -535,19 +674,32 @@ private struct MomentFeedRow: View {
                             }
                         }
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(MomentsPalette.mint)
+                        .foregroundStyle(MomentsPalette.authorBlue)
                         .buttonStyle(.plain)
                         .disabled(commentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 16)
-        .padding(.vertical, 17)
-        .background(MomentsPalette.pageBackground)
+        .padding(.top, 16)
+        .padding(.bottom, 17)
+        .overlay(alignment: .bottom) {
+            Divider().padding(.leading, 64)
+        }
+    }
+
+    private func commentTextView(_ comment: MomentComment) -> Text {
+        let author = comment.userName.isEmpty ? "IMIM 用户" : comment.userName
+        var line = Text(author).foregroundColor(MomentsPalette.authorBlue)
+        if let replyName = nonBlank(comment.replyToUserName) {
+            line = line + Text(" 回复 ").foregroundColor(MomentsPalette.primaryText)
+                + Text(replyName).foregroundColor(MomentsPalette.authorBlue)
+        }
+        return line + Text(": " + (comment.isDeleted ? AppLocalization.text("该评论已删除") : comment.content))
+            .foregroundColor(comment.isDeleted ? MomentsPalette.secondaryText : MomentsPalette.primaryText)
     }
 }
 
@@ -560,26 +712,29 @@ private struct MomentMediaGrid: View {
             if media.count == 1, let item = media.first {
                 if item.isVideo {
                     MomentVideoCard(item: item)
+                        .frame(maxWidth: 240, alignment: .leading)
                 } else {
-                    MomentMediaThumb(item: item, height: nil) {
+                    MomentMediaThumb(item: item) {
                         selectedPhoto = MomentPhotoDestination(item: item)
                     }
+                    .frame(maxWidth: 240, alignment: .leading)
                 }
             } else if !media.isEmpty {
                 LazyVGrid(
-                    columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: min(media.count, 3)),
-                    spacing: 6
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: media.count == 2 || media.count == 4 ? 2 : 3),
+                    spacing: 4
                 ) {
                     ForEach(Array(media.prefix(9).enumerated()), id: \.offset) { _, item in
                         if item.isVideo {
                             MomentVideoCard(item: item)
                         } else {
-                            MomentMediaThumb(item: item, height: 105) {
+                            MomentMediaThumb(item: item, isSquare: true) {
                                 selectedPhoto = MomentPhotoDestination(item: item)
                             }
                         }
                     }
                 }
+                .frame(maxWidth: media.count == 2 || media.count == 4 ? 220 : 300, alignment: .leading)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -640,14 +795,15 @@ private struct MomentVideoCard: View {
                         }
                     }
 
-                    Color.black.opacity(0.30)
+                    Color.black.opacity(0.10)
 
                     Image(systemName: "play.fill")
-                        .font(.system(size: 27, weight: .bold))
-                        .foregroundStyle(.black.opacity(0.82))
-                        .frame(width: 62, height: 62)
-                        .background(.white.opacity(0.94), in: Circle())
-                        .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .offset(x: 1)
+                        .frame(width: 40, height: 40)
+                        .background(.black.opacity(0.26), in: Circle())
+                        .overlay { Circle().stroke(.white.opacity(0.75), lineWidth: 1.25) }
                 }
             }
             .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -665,14 +821,14 @@ private struct MomentVideoCard: View {
             }
             .task(id: playbackURL) {
                 guard let playbackURL else { return }
-                thumbnail.load(url: playbackURL)
+                await thumbnail.load(url: playbackURL)
             }
     }
 }
 
 private struct MomentMediaThumb: View {
     let item: MomentMediaItem
-    let height: CGFloat?
+    var isSquare = false
     let onOpen: () -> Void
     @State private var retryID = UUID()
 
@@ -697,17 +853,22 @@ private struct MomentMediaThumb: View {
         }
         .id(retryID)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: isSquare ? 4 : 6, style: .continuous))
     }
 
     @ViewBuilder
     private func mediaImage(_ image: Image) -> some View {
-        if let height {
-            image.resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(maxWidth: .infinity)
-                .frame(height: height)
-                .clipped()
+        if isSquare {
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    GeometryReader { geometry in
+                        image.resizable()
+                            .scaledToFill()
+                            .frame(width: geometry.size.width, height: geometry.size.height)
+                            .clipped()
+                    }
+                }
         } else {
             image.resizable()
                 .aspectRatio(contentMode: .fit)
@@ -716,25 +877,27 @@ private struct MomentMediaThumb: View {
     }
 
     private var loadingMedia: some View {
-        MomentsPalette.actionBackground
-            .aspectRatio(height == nil ? 4.0 / 3.0 : nil, contentMode: .fit)
-            .frame(maxWidth: .infinity)
-            .frame(height: height)
-            .overlay(ProgressView().tint(MomentsPalette.accent).scaleEffect(0.78))
+        ZStack {
+            MomentsPalette.actionBackground
+            ProgressView().tint(MomentsPalette.accent).scaleEffect(0.78)
+        }
+        .frame(maxWidth: .infinity)
+        .aspectRatio(isSquare ? 1 : 4.0 / 3.0, contentMode: .fit)
     }
 
     private var unavailableMedia: some View {
-        VStack(spacing: 7) {
-            Image(systemName: "photo")
-                .font(.system(size: 22, weight: .medium))
-            Text("加载失败，点按重试")
-                .font(.caption)
+        ZStack {
+            MomentsPalette.actionBackground
+            VStack(spacing: 7) {
+                Image(systemName: "photo")
+                    .font(.system(size: 22, weight: .medium))
+                Text("加载失败，点按重试")
+                    .font(.caption)
+            }
+            .foregroundStyle(MomentsPalette.tertiaryText)
         }
-        .foregroundStyle(MomentsPalette.tertiaryText)
         .frame(maxWidth: .infinity)
-        .frame(height: height)
-        .background(MomentsPalette.actionBackground)
-        .aspectRatio(height == nil ? 4.0 / 3.0 : nil, contentMode: .fit)
+        .aspectRatio(isSquare ? 1 : 4.0 / 3.0, contentMode: .fit)
     }
 }
 
@@ -796,32 +959,117 @@ private struct MomentPhotoViewer: View {
 private struct MomentAvatar: View {
     let name: String
     let url: String?
+    var userId: String? = nil
     let size: CGFloat
+    var allowsSourceUpdates = false
 
     var body: some View {
-        AsyncImage(url: momentURL(url)) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().aspectRatio(contentMode: .fill)
-            default:
-                Text(String(name.prefix(1)).uppercased())
-                    .font(.system(size: max(14, size * 0.38), weight: .bold))
-                    .foregroundStyle(MomentsPalette.primaryText)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(MomentsPalette.avatarFallback)
-            }
-        }
+        DoveCachedAvatarImage(name: name, url: momentAvatarSource(url), userId: userId,
+                              size: size, isGroup: false, allowsSourceUpdates: allowsSourceUpdates,
+                              placeholderImage: placeholder)
         .frame(width: size, height: size)
-        .clipShape(Circle())
-        .overlay(Circle().stroke(Color.white.opacity(0.26), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(Color.white.opacity(0.34), lineWidth: 1)
+        }
+    }
+
+    private var placeholder: UIImage {
+        UIGraphicsImageRenderer(size: CGSize(width: size, height: size)).image { context in
+            UIColor(MomentsPalette.avatarFallback).setFill()
+            context.fill(CGRect(x: 0, y: 0, width: size, height: size))
+            let text = String(name.prefix(1)).uppercased() as NSString
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: max(14, size * 0.38), weight: .bold),
+                .foregroundColor: UIColor(MomentsPalette.primaryText)
+            ]
+            let textSize = text.size(withAttributes: attributes)
+            text.draw(at: CGPoint(x: (size - textSize.width) / 2, y: (size - textSize.height) / 2), withAttributes: attributes)
+        }
     }
 }
 
 private struct MomentVideoPlayer: View {
+    @Environment(\.dismiss) private var dismiss
     let url: URL
+    @State private var localURL: URL?
+    @State private var errorMessage: String?
+    @State private var retryID = 0
 
     var body: some View {
-        NativeFullscreenVideoPlayer(url: url)
+        ZStack(alignment: .topTrailing) {
+            Color.black.ignoresSafeArea()
+            if let localURL {
+                NativeFullscreenVideoPlayer(url: localURL)
+                    .ignoresSafeArea()
+            } else if let errorMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.title)
+                    Text("视频加载失败")
+                    AppLocalizedText(errorMessage).font(.footnote).multilineTextAlignment(.center)
+                    Button("重新加载") { retryID += 1 }
+                        .buttonStyle(.borderedProminent)
+                }
+                .foregroundStyle(.white)
+                .padding(24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                VStack(spacing: 12) {
+                    ProgressView().tint(.white)
+                    Text("正在加载视频…").foregroundStyle(.white)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            Button { dismiss() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .background(.black.opacity(0.55), in: Circle())
+            }
+            .accessibilityLabel("关闭视频")
+            .padding(16)
+        }
+        .task(id: retryID) { await loadVideo() }
+        .onDisappear { removeLocalVideo() }
+    }
+
+    @MainActor
+    private func loadVideo() async {
+        errorMessage = nil
+        do {
+            // The legacy /api/media/{id} endpoint ignores HTTP Range. A local
+            // file gives AVPlayer reliable seeking without changing that server.
+            let downloaded = try await downloadVideo(url)
+            if Task.isCancelled {
+                try? FileManager.default.removeItem(at: downloaded)
+                return
+            }
+            localURL = downloaded
+        } catch {
+            guard !Task.isCancelled else { return }
+            errorMessage = "请检查网络后重试；若仍失败，该视频文件可能不可用。"
+        }
+    }
+
+    private func downloadVideo(_ source: URL) async throws -> URL {
+        let cachedURL = try await MomentVideoAssetCache.shared.file(for: source)
+        try Task.checkCancellation()
+        let fileExtension = source.pathExtension.isEmpty ? "mp4" : source.pathExtension
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("imim-moment-\(UUID().uuidString)")
+            .appendingPathExtension(fileExtension)
+        // The player owns its copy; closing it must not delete the thumbnail cache.
+        try FileManager.default.copyItem(at: cachedURL, to: destination)
+        return destination
+    }
+
+    private func removeLocalVideo() {
+        guard let localURL else { return }
+        try? FileManager.default.removeItem(at: localURL)
+        self.localURL = nil
     }
 }
 
@@ -841,6 +1089,11 @@ private struct NativeFullscreenVideoPlayer: UIViewControllerRepresentable {
         uiViewController.player = AVPlayer(url: url)
         uiViewController.player?.play()
     }
+
+    static func dismantleUIViewController(_ uiViewController: AVPlayerViewController, coordinator: ()) {
+        uiViewController.player?.pause()
+        uiViewController.player = nil
+    }
 }
 
 @MainActor
@@ -848,7 +1101,7 @@ private final class MomentVideoThumbnailModel: ObservableObject {
     private static let cache = NSCache<NSURL, UIImage>()
     @Published private(set) var image: UIImage?
 
-    func load(url: URL) {
+    func load(url: URL) async {
         let key = url as NSURL
         if let cached = Self.cache.object(forKey: key) {
             image = cached
@@ -856,20 +1109,71 @@ private final class MomentVideoThumbnailModel: ObservableObject {
         }
 
         image = nil
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let asset = AVURLAsset(url: url)
+        do {
+            // Extensionless legacy media cannot serve Range requests. Generate
+            // its cover from the cached local file, also reused when tapped.
+            let source: URL
+            if url.path.hasPrefix("/api/media/"), url.pathExtension.isEmpty {
+                source = try await MomentVideoAssetCache.shared.file(for: url)
+            } else {
+                source = url
+            }
+            try Task.checkCancellation()
+            let asset = AVURLAsset(url: source)
             let generator = AVAssetImageGenerator(asset: asset)
             generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 1280, height: 720)
-            let cgImage = try? generator.copyCGImage(at: .zero, actualTime: nil)
-            let thumbnail = cgImage.map(UIImage.init(cgImage:))
-            if let thumbnail {
-                Self.cache.setObject(thumbnail, forKey: key)
-            }
-            DispatchQueue.main.async {
-                self?.image = thumbnail
-            }
+            generator.maximumSize = CGSize(width: 720, height: 720)
+            let frame = try await generator.image(at: CMTime(seconds: 0.1, preferredTimescale: 600))
+            try Task.checkCancellation()
+            let thumbnail = UIImage(cgImage: frame.image)
+            Self.cache.setObject(thumbnail, forKey: key)
+            image = thumbnail
+        } catch {
+            // Keep the playable video card if a thumbnail cannot be generated.
         }
+    }
+}
+
+private actor MomentVideoAssetCache {
+    static let shared = MomentVideoAssetCache()
+    private var files: [URL: URL] = [:]
+    private var downloads: [URL: Task<URL, Error>] = [:]
+
+    func file(for source: URL) async throws -> URL {
+        if let file = files[source], FileManager.default.fileExists(atPath: file.path) {
+            return file
+        }
+        if let download = downloads[source] { return try await download.value }
+        // Service-owned: thumbnail and player share one transfer. Leaving a row
+        // must not cancel a download that an open player is also waiting for.
+        let download = Task { try await Self.download(source) }
+        downloads[source] = download
+        defer { downloads[source] = nil }
+        let file = try await download.value
+        if files.count >= 8, let oldest = files.first {
+            try? FileManager.default.removeItem(at: oldest.value)
+            files[oldest.key] = nil
+        }
+        files[source] = file
+        return file
+    }
+
+    private static func download(_ source: URL) async throws -> URL {
+        var request = URLRequest(url: source, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = 180
+        // Public or pre-signed media only; don't forward bearer tokens to COS.
+        let (temporaryURL, response) = try await URLSession.shared.download(for: request)
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        guard let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              http.mimeType?.hasPrefix("video/") == true
+                || http.mimeType == "application/octet-stream" else {
+            throw URLError(.badServerResponse)
+        }
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("imim-video-cache-\(UUID().uuidString).mp4")
+        try FileManager.default.moveItem(at: temporaryURL, to: file)
+        return file
     }
 }
 
@@ -909,7 +1213,7 @@ private struct MomentComposerSheet: View {
                     matching: .any(of: [.images, .videos])
                 ) {
                     Label(
-                        selectedItems.isEmpty ? "添加图片或视频" : "已选择 \(selectedItems.count) 个媒体",
+                        selectedItems.isEmpty ? AppLocalization.string("添加图片或视频") : AppLocalization.text("已选择 \(selectedItems.count) 个媒体"),
                         systemImage: "photo.on.rectangle.angled"
                     )
                     .font(.system(size: 14, weight: .semibold))
@@ -918,7 +1222,7 @@ private struct MomentComposerSheet: View {
                 .buttonStyle(.plain)
 
                 if let errorMessage {
-                    Text(errorMessage)
+                    AppLocalizedText(errorMessage)
                         .font(.system(size: 13))
                         .foregroundStyle(.red.opacity(0.9))
                 }
@@ -939,7 +1243,7 @@ private struct MomentComposerSheet: View {
                         .foregroundStyle(MomentsPalette.secondaryText)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(isSubmitting ? "发布中" : "发布") {
+                    Button(isSubmitting ? AppLocalization.text("发布中") : AppLocalization.text("发布")) {
                         submit()
                     }
                     .disabled(isSubmitting || (content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && selectedItems.isEmpty))
@@ -998,7 +1302,7 @@ private struct MomentCommentSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("评论 \(authorName.isEmpty ? "这条动态" : authorName + " 的动态")")
+            Text("评论 \(authorName.isEmpty ? AppLocalization.string("这条动态") : authorName + AppLocalization.string(" 的动态"))")
                 .font(.system(size: 18, weight: .bold))
                 .foregroundStyle(MomentsPalette.primaryText)
 
@@ -1010,7 +1314,7 @@ private struct MomentCommentSheet: View {
                 .background(MomentsPalette.actionBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             if let errorMessage {
-                Text(errorMessage)
+                AppLocalizedText(errorMessage)
                     .font(.system(size: 12))
                     .foregroundStyle(.red.opacity(0.9))
             }
@@ -1019,7 +1323,7 @@ private struct MomentCommentSheet: View {
                 Button("取消") { dismiss() }
                     .foregroundStyle(MomentsPalette.secondaryText)
                 Spacer()
-                Button(isSubmitting ? "发送中" : "发送") {
+                Button(isSubmitting ? AppLocalization.text("发送中") : AppLocalization.text("发送")) {
                     submit()
                 }
                 .fontWeight(.semibold)
@@ -1054,6 +1358,26 @@ private enum MomentComposerError: LocalizedError {
     }
 }
 
+private struct MomentGlassCircle: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content
+                .glassEffect(.regular.interactive(), in: Circle())
+                .overlay {
+                    Circle().stroke(.white.opacity(0.22), lineWidth: 0.7)
+                }
+        } else {
+            content
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay {
+                    Circle().stroke(.white.opacity(0.22), lineWidth: 0.7)
+                }
+                .shadow(color: .black.opacity(0.10), radius: 8, y: 3)
+        }
+    }
+}
+
 private enum MomentsPalette {
     private static func dynamic(dark: UIColor, light: UIColor) -> Color {
         Color(uiColor: UIColor { traits in
@@ -1065,14 +1389,23 @@ private enum MomentsPalette {
     static let primaryText = dynamic(dark: .white, light: .black)
     static let secondaryText = dynamic(dark: UIColor(white: 0.6, alpha: 1), light: .secondaryLabel)
     static let tertiaryText = dynamic(dark: UIColor(white: 0.45, alpha: 1), light: .tertiaryLabel)
+    static let cardSurface = dynamic(dark: UIColor(white: 0.095, alpha: 1), light: .white)
+    static let cardStroke = dynamic(dark: UIColor(white: 0.20, alpha: 1), light: UIColor(white: 0.88, alpha: 1))
     static let accent = DoveTheme.accent
     static let onAccent = dynamic(dark: .white, light: .white)
     static let mint = accent
-    static let coverGreen = dynamic(
-        dark: UIColor(red: 0.15, green: 0.46, blue: 0.30, alpha: 1),
-        light: UIColor(red: 0.35, green: 0.70, blue: 0.48, alpha: 1)
+    static let coverSlate = dynamic(
+        dark: UIColor(red: 0.16, green: 0.18, blue: 0.19, alpha: 1),
+        light: UIColor(red: 0.30, green: 0.34, blue: 0.35, alpha: 1)
     )
-    static let authorBlue = accent
+    static let coverCharcoal = dynamic(
+        dark: UIColor(red: 0.045, green: 0.055, blue: 0.06, alpha: 1),
+        light: UIColor(red: 0.09, green: 0.11, blue: 0.12, alpha: 1)
+    )
+    static let authorBlue = dynamic(
+        dark: UIColor(red: 0.60, green: 0.70, blue: 0.90, alpha: 1),
+        light: UIColor(red: 0.31, green: 0.40, blue: 0.58, alpha: 1)
+    )
     static let like = Color(red: 1.0, green: 0.42, blue: 0.45)
     static let divider = dynamic(dark: UIColor(white: 0.15, alpha: 1), light: .separator)
     static let actionBackground = dynamic(dark: UIColor(white: 0.14, alpha: 1), light: UIColor(white: 0.93, alpha: 1))
@@ -1084,6 +1417,15 @@ private enum MomentsPalette {
     )
 }
 
+private func momentAvatarSource(_ value: String?) -> String? {
+    guard let value = nonBlank(value) else { return nil }
+    if value.hasPrefix("asset://") || value.hasPrefix("file://")
+        || (value.hasPrefix("/") && FileManager.default.fileExists(atPath: value)) {
+        return value
+    }
+    return momentURL(value)?.absoluteString
+}
+
 private func momentURL(_ value: String?) -> URL? {
     guard var value, !value.isEmpty else { return nil }
     value = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1091,9 +1433,9 @@ private func momentURL(_ value: String?) -> URL? {
         return URL(string: value) ?? URL(string: value.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) ?? "")
     }
     if value.hasPrefix("/") {
-        return URL(string: "https://wed.imim.chat\(value)")
+        return URL(string: "\(AppServer.origin)\(value)")
     }
-    return URL(string: "https://wed.imim.chat/\(value)")
+    return URL(string: "\(AppServer.origin)/\(value)")
 }
 
 private func nonBlank(_ value: String?) -> String? {
@@ -1114,6 +1456,7 @@ private extension MomentFeedItem {
             location: location,
             likeCount: likeCount,
             commentCount: commentCount,
+            comments: comments,
             isLiked: isLiked,
             createdAt: createdAt
         )
@@ -1131,6 +1474,7 @@ private extension MomentFeedItem {
         location: String?,
         likeCount: Int,
         commentCount: Int,
+        comments: [MomentComment],
         isLiked: Bool,
         createdAt: Int64
     ) {
@@ -1143,18 +1487,19 @@ private extension MomentFeedItem {
         self.location = location
         self.likeCount = likeCount
         self.commentCount = commentCount
+        self.comments = comments
         self.isLiked = isLiked
         self.createdAt = createdAt
     }
 }
 
 private extension Int64 {
-    var darkMomentTimeText: String {
+    var momentDateText: String {
         guard self > 0 else { return "刚刚" }
         let date = Date(milliseconds: self)
-        let formatter = RelativeDateTimeFormatter()
-        formatter.locale = Locale(identifier: "en_US")
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+        let formatter = DateFormatter()
+        formatter.locale = AppLanguage.current.locale
+        formatter.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm" : "M/d"
+        return formatter.string(from: date)
     }
 }

@@ -285,7 +285,7 @@ final class VoiceRecorderManager: NSObject, ObservableObject {
         if string.hasPrefix("http") || string.hasPrefix("file://") {
             return URL(string: string)
         }
-        return URL(string: "https://wed.imim.chat\(string)")
+        return URL(string: "\(AppServer.origin)\(string)")
     }
 }
 

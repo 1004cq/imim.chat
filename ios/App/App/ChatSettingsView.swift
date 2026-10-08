@@ -153,8 +153,10 @@ struct ChatSettingsView: View {
                 }
                 settingsCard {
                     Toggle("消息免打扰", isOn: mutedBinding)
-                    Divider()
-                    Toggle("置顶聊天", isOn: chatBooleanBinding(\.isPinned))
+                    if !chat.isBuiltinSystemConversation {
+                        Divider()
+                        Toggle("置顶聊天", isOn: chatBooleanBinding(\.isPinned))
+                    }
                     Divider()
                     Toggle("聊天密码", isOn: passwordBinding)
                     Divider()
@@ -219,9 +221,9 @@ struct ChatSettingsView: View {
 
     private var profileHeader: some View {
         VStack(spacing: 10) {
-            DoveAvatar(name: chat.name, url: chat.avatar, size: 76, isGroup: chat.type == "group")
+            DoveAvatar(name: chat.name, url: chat.avatar, userId: chat.avatarPeerUserId, size: 76, isGroup: chat.type == "group")
             Text(chat.name).font(.title3.weight(.semibold)).foregroundStyle(DoveTheme.ink)
-            Text(chat.type == "group" ? "群聊" : "端到端加密私聊")
+            Text(chat.type == "group" ? AppLocalization.text("群聊") : AppLocalization.text("端到端加密私聊"))
                 .font(.footnote).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
@@ -296,7 +298,7 @@ private struct SettingsNavigationRow: View {
             Image(systemName: icon)
                 .foregroundStyle(DoveTheme.green)
                 .frame(width: 22)
-            Text(title).foregroundStyle(DoveTheme.ink)
+            AppLocalizedText(title).foregroundStyle(DoveTheme.ink)
             Spacer()
             Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
         }
@@ -327,7 +329,7 @@ private struct ConversationBackgroundPicker: View {
                     ConversationBackground(style: style)
                         .frame(width: 76, height: 48)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    Text(style.title).foregroundStyle(DoveTheme.ink)
+                    AppLocalizedText(style.title).foregroundStyle(DoveTheme.ink)
                     Spacer()
                     if selectedStyle == style { Image(systemName: "checkmark.circle.fill").foregroundStyle(DoveTheme.green) }
                 }
@@ -358,7 +360,7 @@ private struct ChatMessageSearchView: View {
             } else {
                 ForEach(results, id: \.messageId) { message in
                     VStack(alignment: .leading, spacing: 5) {
-                        Text(message.isOutgoing ? "我" : chat.name).font(.caption).foregroundStyle(.secondary)
+                        Text(message.isOutgoing ? AppLocalization.text("我") : chat.name).font(.caption).foregroundStyle(.secondary)
                         Text(message.content).foregroundStyle(DoveTheme.ink).lineLimit(2)
                         Text(message.createdAt.formatted(date: .abbreviated, time: .shortened)).font(.caption2).foregroundStyle(.tertiary)
                     }
@@ -389,7 +391,7 @@ private struct ConversationPasscodeSheet: View {
                     SecureField("再次输入密码", text: $confirmation)
                         .keyboardType(.numberPad)
                 }
-                if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                if let errorMessage { AppLocalizedText(errorMessage).foregroundStyle(.red) }
             }
             .navigationTitle("聊天密码")
             .toolbar {
@@ -429,7 +431,7 @@ struct ConversationUnlockOverlay: View {
                 .multilineTextAlignment(.center)
                 .padding(12)
                 .background(.background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            if let errorMessage { Text(errorMessage).font(.footnote).foregroundStyle(.red) }
+            if let errorMessage { AppLocalizedText(errorMessage).font(.footnote).foregroundStyle(.red) }
             Button("解锁", action: unlock)
                 .buttonStyle(.borderedProminent)
                 .tint(DoveTheme.green)

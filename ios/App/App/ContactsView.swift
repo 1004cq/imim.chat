@@ -7,10 +7,12 @@ struct ContactsView: View {
     @State private var isShowingAddFriend = false
     @State private var isShowingScanner = false
     @State private var friends: [RemoteFriend] = []
+    @State private var friendRequests: [RemoteFriendRequest] = []
     @State private var selectedChat: Chat?
     @State private var searchText = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var scannedUserID: String?
 
     private var privateChats: [Chat] {
         chats
@@ -19,10 +21,7 @@ struct ContactsView: View {
     }
 
     private var allContacts: [ContactListItem] {
-        if !friends.isEmpty {
-            return friends.map(ContactListItem.friend)
-        }
-        return privateChats.map(ContactListItem.chat)
+        friends.map(ContactListItem.friend)
     }
 
     private var filteredContacts: [ContactListItem] {
@@ -79,15 +78,26 @@ struct ContactsView: View {
         .navigationDestination(for: Chat.self) { chat in
             ChatDetailView(chat: chat)
         }
-        .sheet(isPresented: $isShowingAddFriend) {
-            AddFriendView { chat in
+        .sheet(isPresented: $isShowingAddFriend, onDismiss: {
+            scannedUserID = nil
+            Task { await loadFriends() }
+        }) {
+            AddFriendView(initialAccount: scannedUserID ?? "") { chat in
                 selectedChat = chat
                 Task { await loadFriends() }
             }
         }
         .sheet(isPresented: $isShowingScanner) {
-            QRCodeScannerView { _ in
+            QRCodeScannerView { result in
                 isShowingScanner = false
+                guard let userID = QRCodeGenerator.userID(from: result) else {
+                    errorMessage = "这不是有效的 IMIM 好友二维码"
+                    return
+                }
+                scannedUserID = userID
+                DispatchQueue.main.async {
+                    isShowingAddFriend = true
+                }
             }
         }
         .sheet(item: $selectedChat) { chat in
@@ -102,6 +112,12 @@ struct ContactsView: View {
             Task { await loadFriends() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .cqimProfileDidChange)) { _ in
+            Task { await loadFriends() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cqimFriendshipDidChange)) { _ in
+            Task { await loadFriends() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             Task { await loadFriends() }
         }
     }
@@ -174,9 +190,9 @@ struct ContactsView: View {
             .padding(.vertical, 12)
         } else if filteredContacts.isEmpty {
             ContentUnavailableView(
-                searchText.isEmpty ? "还没有好友" : "没有匹配的联系人",
+                searchText.isEmpty ? AppLocalization.string("还没有好友") : AppLocalization.string("没有匹配的联系人"),
                 systemImage: "person.badge.plus",
-                description: Text(searchText.isEmpty ? "点击右上角添加朋友，创建会话后就可以聊天。" : "换个关键词再试试。")
+                description: Text(searchText.isEmpty ? AppLocalization.text("点击右上角添加朋友，创建会话后就可以聊天。") : AppLocalization.text("换个关键词再试试。"))
             )
             .frame(maxWidth: .infinity)
             .padding(.top, 18)
@@ -212,7 +228,7 @@ struct ContactsView: View {
         }
 
         if let errorMessage {
-            Text(errorMessage)
+            AppLocalizedText(errorMessage)
                 .font(.footnote)
                 .foregroundStyle(.red)
                 .padding(.top, 8)
@@ -220,7 +236,8 @@ struct ContactsView: View {
     }
 
     private var pendingFriendCount: Int {
-        1
+        let userID = UserDefaults.standard.string(forKey: "current_user_id")
+        return friendRequests.filter { $0.status == "pending" && $0.incoming(for: userID) }.count
     }
 
     private var groupChats: [Chat] {
@@ -228,15 +245,32 @@ struct ContactsView: View {
     }
 
     private func loadFriends() async {
-        guard AuthTokenStore.shared.token != nil else { return }
+        guard AuthTokenStore.shared.token != nil,
+              let owner = UserDefaults.standard.string(forKey: "current_user_id"), !owner.isEmpty else {
+            friends = []
+            friendRequests = []
+            return
+        }
+        guard !isLoading else { return }
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
 
         do {
-            friends = try await APIClient.shared.fetchFriends()
+            let result = try await APIClient.shared.fetchFriends()
+            guard UserDefaults.standard.string(forKey: "current_user_id") == owner else { return }
+            friends = result
+            AvatarImageLoader.shared.prefetch(friends.map { .init(userId: $0.id, urlString: $0.avatar) })
         } catch {
             errorMessage = error.localizedDescription
+        }
+        do {
+            let result = try await APIClient.shared.fetchFriendRequests()
+            guard UserDefaults.standard.string(forKey: "current_user_id") == owner else { return }
+            friendRequests = result.filter { $0.fromId == owner || $0.toId == owner }
+        } catch {
+            // Do not hide an already-synced contact list if requests fail.
+            errorMessage = "好友申请暂未同步：\(error.localizedDescription)"
         }
     }
 
@@ -317,7 +351,7 @@ private struct ContactQuickEntry: View {
                     .frame(width: 52, height: 52)
                     .background(tint, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
 
-                Text(title)
+                AppLocalizedText(title)
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(DoveTheme.ink)
 
@@ -332,6 +366,7 @@ private struct ContactQuickEntry: View {
 }
 
 private struct ContactRow: View {
+    @Environment(\.locale) private var locale
     let item: ContactListItem
 
     var body: some View {
@@ -339,6 +374,7 @@ private struct ContactRow: View {
             DoveAvatar(
                 name: item.name,
                 url: item.avatar,
+                userId: item.id,
                 size: 52,
                 isGroup: item.isGroup,
                 isOnline: item.isOnline
@@ -360,6 +396,7 @@ private struct ContactRow: View {
         }
         .padding(.vertical, 13)
         .contentShape(Rectangle())
+        .environment(\.locale, locale)
     }
 }
 
@@ -417,14 +454,14 @@ private struct ContactListItem: Identifiable {
     var statusText: String {
         switch source {
         case .friend(let friend):
-            if friend.online == true { return "在线" }
+            if friend.online == true { return AppLocalization.string("在线") }
             if let lastSeen = friend.lastSeen {
                 let date = Date(milliseconds: lastSeen)
-                return "最后在线 \(date.chatListTimeText)"
+                return AppLocalization.text("最后在线 \(date.chatListTimeText)")
             }
-            return friend.bio?.isEmpty == false ? friend.bio! : "离线"
+            return friend.bio?.isEmpty == false ? friend.bio! : AppLocalization.string("离线")
         case .chat(let chat):
-            return chat.lastMessage.isEmpty ? "点击开始聊天" : chat.lastMessage
+            return chat.lastMessage.isEmpty ? AppLocalization.string("点击开始聊天") : chat.lastMessage
         }
     }
 

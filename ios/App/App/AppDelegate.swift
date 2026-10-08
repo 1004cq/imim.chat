@@ -56,15 +56,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        let userInfo = notification.request.content.userInfo
-        let chatId = (userInfo["chatId"] as? String)
-            ?? (userInfo["conversationId"] as? String)
-            ?? ""
-        if NotificationRouter.shared.activeConversationId == chatId {
-            completionHandler([])
-            return
-        }
-        completionHandler([.banner, .list, .sound, .badge])
+        completionHandler(PushNotificationManager.shared.foregroundPresentationOptions(for: notification))
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {

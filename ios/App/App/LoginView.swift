@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 struct LoginView: View {
@@ -47,7 +48,7 @@ struct LoginView: View {
 
                     Picker("登录方式", selection: $mode) {
                         ForEach(LoginMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
+                            AppLocalizedText(mode.rawValue).tag(mode)
                         }
                     }
                     .pickerStyle(.segmented)
@@ -64,7 +65,7 @@ struct LoginView: View {
                     }
 
                     if let message = authSession.errorMessage {
-                        Text(message)
+                        AppLocalizedText(message)
                             .font(.footnote)
                             .foregroundStyle(.red)
                             .transition(.opacity)
@@ -83,9 +84,9 @@ struct LoginView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title)
+            AppLocalizedText(title)
                 .font(.largeTitle.bold())
-            Text(subtitle)
+            AppLocalizedText(subtitle)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -255,7 +256,7 @@ struct LoginView: View {
                     ProgressView()
                         .tint(.white)
                 }
-                Text(authSession.isLoading ? loadingTitle : title)
+                AppLocalizedText(authSession.isLoading ? loadingTitle : title)
                     .fontWeight(.semibold)
             }
             .frame(maxWidth: .infinity)
@@ -270,7 +271,7 @@ struct LoginView: View {
         Button {
             Task { await action() }
         } label: {
-            Text(cooldown > 0 ? "\(cooldown)s" : title)
+            AppLocalizedText(cooldown > 0 ? "\(cooldown)s" : title)
                 .font(.footnote.weight(.semibold))
                 .frame(width: 96)
                 .padding(.vertical, 14)

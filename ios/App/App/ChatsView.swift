@@ -5,7 +5,9 @@ import UIKit
 
 struct ChatsView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("isDarkMode") private var isDarkMode = false
+    @AppStorage(AppLanguage.preferenceKey) private var languagePreference = AppLanguage.system.rawValue
     @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
     @StateObject private var viewModel = ChatsViewModel()
     @State private var isShowingAddFriend = false
@@ -14,16 +16,15 @@ struct ChatsView: View {
     @State private var isShowingQRCode = false
     @State private var isShowingPlusMenu = false
     @State private var scannedCode: String?
-
-    private var conversations: [ChatConversationModel] {
-        viewModel.conversations(from: chats)
-    }
-
-    private var totalUnread: Int {
-        viewModel.totalUnread(in: chats)
-    }
+    @State private var scannedUserID: String?
 
     var body: some View {
+        // Reformat app-owned previews when language changes; never modify Chat.
+        let _ = languagePreference
+        // Compute once for both the empty state and lazy row iteration. The
+        // snapshot lives only in this evaluation; SwiftData remains authoritative.
+        let rows = viewModel.conversationRows(from: chats)
+
         ZStack {
             DoveTheme.paper.ignoresSafeArea()
 
@@ -35,12 +36,12 @@ struct ChatsView: View {
                         if viewModel.isRefreshing && chats.isEmpty {
                             ChatListSkeleton()
                                 .padding(.top, 8)
-                        } else if conversations.isEmpty {
+                        } else if rows.isEmpty {
                             emptyState
                                 .padding(.top, 44)
                         } else {
                             if let errorMessage = viewModel.errorMessage {
-                                Text(errorMessage)
+                                AppLocalizedText(errorMessage)
                                     .font(.footnote)
                                     .foregroundStyle(.red)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -48,8 +49,15 @@ struct ChatsView: View {
                                     .padding(.vertical, 8)
                             }
 
-                            ForEach(conversations) { conversation in
-                                if let chat = chats.first(where: { $0.chatId == conversation.id }) {
+                            ForEach(rows) { row in
+                                let chat = row.chat
+                                let conversation = row.conversation
+                                if chat.isBuiltinSystemConversation {
+                                    ConversationCell(
+                                        chat: chat,
+                                        conversation: conversation
+                                    )
+                                } else {
                                     ConversationCell(
                                         chat: chat,
                                         conversation: conversation
@@ -65,15 +73,15 @@ struct ChatsView: View {
                                         Button {
                                             viewModel.togglePinned(chat, modelContext: modelContext)
                                         } label: {
-                                            Label(chat.isPinned ? "取消置顶" : "置顶", systemImage: "pin.fill")
+                                            Label(chat.isPinned ? AppLocalization.text("取消置顶") : AppLocalization.text("置顶"), systemImage: "pin.fill")
                                         }
-                                        .tint(DoveTheme.green)
                                     }
+                                    .tint(DoveTheme.green)
                                     .contextMenu {
                                         Button {
                                             viewModel.togglePinned(chat, modelContext: modelContext)
                                         } label: {
-                                            Label(chat.isPinned ? "取消置顶" : "置顶聊天", systemImage: "pin")
+                                            Label(chat.isPinned ? AppLocalization.text("取消置顶") : AppLocalization.text("置顶聊天"), systemImage: "pin")
                                         }
 
                                         Button(role: .destructive) {
@@ -120,38 +128,37 @@ struct ChatsView: View {
         .navigationTitle("消息")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 16) {
-                    Button {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
                         isDarkMode.toggle()
-                    } label: {
-                        Image(systemName: isDarkMode ? "sun.max.fill" : "moon.fill")
-                            .foregroundStyle(isDarkMode ? .yellow : DoveTheme.ink)
                     }
-                    .buttonStyle(.plain)
-
-                    Button {
-                        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
-                            isShowingPlusMenu.toggle()
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 19, weight: .regular))
-                            .foregroundStyle(DoveTheme.ink)
-                    }
-                    .buttonStyle(.plain)
+                } label: {
+                    Image(systemName: isDarkMode ? "sun.max.fill" : "moon.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(DoveTheme.ink)
                 }
-            }
+                .accessibilityLabel(isDarkMode ? AppLocalization.text("切换浅色模式") : AppLocalization.text("切换深色模式"))
 
-            ToolbarItem(placement: .topBarLeading) {
-                DoveUnreadBadge(count: totalUnread)
+                Button {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                        isShowingPlusMenu.toggle()
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(DoveTheme.ink)
+                }
+                .accessibilityLabel("更多操作")
             }
         }
         .navigationDestination(for: Chat.self) { chat in
             ChatDetailView(chat: chat)
         }
-        .sheet(isPresented: $isShowingAddFriend) {
-            AddFriendView()
+        .sheet(isPresented: $isShowingAddFriend, onDismiss: {
+            scannedUserID = nil
+        }) {
+            AddFriendView(initialAccount: scannedUserID ?? "")
         }
         .sheet(isPresented: $isShowingCreateGroup) {
             CreateGroupSheet { group in
@@ -180,6 +187,15 @@ struct ChatsView: View {
         } message: {
             Text(scannedCode ?? "")
         }
+        .onChange(of: scannedCode) { _, code in
+            guard let code,
+                  let userID = QRCodeGenerator.userID(from: code) else { return }
+            scannedCode = nil
+            scannedUserID = userID
+            DispatchQueue.main.async {
+                isShowingAddFriend = true
+            }
+        }
         .task {
             await viewModel.refresh(chats: chats, modelContext: modelContext)
         }
@@ -196,7 +212,7 @@ struct ChatsView: View {
     }
 
     private var searchAndFilters: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             ConversationFilterPills(
                 selection: $viewModel.filter,
                 groupUnread: viewModel.groupUnread(in: chats)
@@ -204,9 +220,9 @@ struct ChatsView: View {
 
             DoveSearchBar(text: $viewModel.searchText, placeholder: "搜索聊天记录")
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
-        .padding(.bottom, 14)
+        .padding(.horizontal, 18)
+        .padding(.top, 12)
+        .padding(.bottom, 12)
     }
 
     private var emptyState: some View {
@@ -215,11 +231,11 @@ struct ChatsView: View {
                 .font(.system(size: 34, weight: .medium))
                 .foregroundStyle(DoveTheme.green.opacity(0.55))
 
-            Text(viewModel.searchText.isEmpty ? "暂无会话" : "没有匹配的会话")
+            Text(viewModel.searchText.isEmpty ? AppLocalization.text("暂无会话") : AppLocalization.text("没有匹配的会话"))
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(DoveTheme.ink)
 
-            Text(viewModel.searchText.isEmpty ? "下拉刷新同步服务器会话。" : "换个关键词再试试。")
+            Text(viewModel.searchText.isEmpty ? AppLocalization.text("下拉刷新同步服务器会话。") : AppLocalization.text("换个关键词再试试。"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -261,6 +277,7 @@ private struct ConversationCell: View {
                 DoveAvatar(
                     name: conversation.title,
                     url: conversation.avatarURL,
+                    userId: chat.avatarPeerUserId,
                     size: 56,
                     isGroup: conversation.isGroup,
                     isOnline: conversation.isOnline
@@ -273,14 +290,22 @@ private struct ConversationCell: View {
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
         .frame(minHeight: 76)
-        .background(conversation.isPinned ? DoveTheme.greenSoft.opacity(0.40) : Color.clear)
+        .background(conversation.isPinned && !chat.isBuiltinSystemConversation ? DoveTheme.green.opacity(0.025) : Color.clear)
+        .overlay(alignment: .leading) {
+            if conversation.isPinned && !chat.isBuiltinSystemConversation {
+                Capsule()
+                    .fill(DoveTheme.green.opacity(0.46))
+                    .frame(width: 3, height: 34)
+                    .padding(.leading, 7)
+            }
+        }
         .contentShape(Rectangle())
     }
 
     private var conversationSummary: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(conversation.title)
+                Text(chat.isBuiltinSystemConversation ? AppLocalization.string(conversation.title) : conversation.title)
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(DoveTheme.ink)
                     .lineLimit(1)
@@ -314,7 +339,7 @@ private struct ConversationCell: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(conversation.subtitle)
                     .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DoveTheme.secondaryText)
                     .lineLimit(1)
 
                 Spacer(minLength: 8)
@@ -358,10 +383,14 @@ private struct ConversationFilterPills: View {
     let groupUnread: Int
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
             filterButton(title: "全部", value: .all, badge: nil)
             filterButton(title: "群聊", value: .group, badge: groupUnread)
         }
+        .padding(4)
+        .background(DoveTheme.warmGray.opacity(0.62), in: Capsule())
+        .fixedSize(horizontal: true, vertical: false)
+        .sensoryFeedback(.selection, trigger: selection)
     }
 
     private func filterButton(title: String, value: IMConversationViewModel.Filter, badge: Int?) -> some View {
@@ -371,21 +400,28 @@ private struct ConversationFilterPills: View {
             }
         } label: {
             HStack(spacing: 6) {
-                Text(title)
+                AppLocalizedText(title)
                 if let badge, badge > 0 {
                     Text("\(badge > 99 ? "99+" : "\(badge)")")
                         .font(.system(size: 11, weight: .bold, design: .rounded))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 2)
-                        .background(DoveTheme.green, in: Capsule())
+                        .background(DoveTheme.seal, in: Capsule())
                 }
             }
-            .font(.system(size: 16, weight: .semibold))
-            .foregroundStyle(selection == value ? .white : DoveTheme.green)
-            .padding(.horizontal, 18)
-            .padding(.vertical, 9)
-            .background(selection == value ? DoveTheme.green : DoveTheme.mist, in: Capsule())
+            .font(.system(size: 15, weight: selection == value ? .bold : .semibold))
+            .foregroundStyle(selection == value ? DoveTheme.green : DoveTheme.secondaryText)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(selection == value ? DoveTheme.cardSurface.opacity(0.98) : Color.clear, in: Capsule())
+            .overlay {
+                if selection == value {
+                    Capsule()
+                        .stroke(DoveTheme.green.opacity(0.18), lineWidth: 0.8)
+                }
+            }
+            .shadow(color: selection == value ? .black.opacity(0.06) : .clear, radius: 6, y: 2)
         }
         .buttonStyle(.plain)
     }
@@ -435,7 +471,7 @@ private struct PlusMenuOverlay: View {
                     .frame(width: 28, height: 28)
                     .background(DoveTheme.greenSoft, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-                Text(title)
+                AppLocalizedText(title)
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(DoveTheme.ink)
 
@@ -554,7 +590,7 @@ private struct CreateGroupSheet: View {
                 .buttonStyle(.plain)
             }
 
-            Text(step == .select ? "发起群聊" : "设置群名称")
+            Text(step == .select ? AppLocalization.text("发起群聊") : AppLocalization.text("设置群名称"))
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(DoveTheme.ink)
 
@@ -589,7 +625,7 @@ private struct CreateGroupSheet: View {
                         ForEach(selectedFriends) { friend in
                             VStack(spacing: 4) {
                                 ZStack(alignment: .topTrailing) {
-                                    DoveAvatar(name: friend.name, url: friend.avatar, size: 38)
+                                    DoveAvatar(name: friend.name, url: friend.avatar, userId: friend.id, size: 38)
                                     Button {
                                         selectedIds.remove(friend.id)
                                     } label: {
@@ -643,7 +679,7 @@ private struct CreateGroupSheet: View {
                                             .font(.system(size: 21, weight: .semibold))
                                             .foregroundStyle(selectedIds.contains(friend.id) ? DoveTheme.green : .secondary.opacity(0.45))
 
-                                        DoveAvatar(name: friend.name, url: friend.avatar, size: 42, isOnline: friend.online == true)
+                                        DoveAvatar(name: friend.name, url: friend.avatar, userId: friend.id, size: 42, isOnline: friend.online == true)
 
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text(friend.name)
@@ -668,7 +704,7 @@ private struct CreateGroupSheet: View {
             }
 
             if let errorMessage {
-                Text(errorMessage)
+                AppLocalizedText(errorMessage)
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .padding(.horizontal, 20)
@@ -696,7 +732,7 @@ private struct CreateGroupSheet: View {
         VStack(spacing: 16) {
             HStack(spacing: -6) {
                 ForEach(selectedFriends.prefix(5)) { friend in
-                    DoveAvatar(name: friend.name, url: friend.avatar, size: 42)
+                    DoveAvatar(name: friend.name, url: friend.avatar, userId: friend.id, size: 42)
                 }
                 if selectedFriends.count > 5 {
                     Text("+\(selectedFriends.count - 5)")
@@ -729,7 +765,7 @@ private struct CreateGroupSheet: View {
             .padding(.horizontal, 20)
 
             if let errorMessage {
-                Text(errorMessage)
+                AppLocalizedText(errorMessage)
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .padding(.horizontal, 20)
@@ -745,7 +781,7 @@ private struct CreateGroupSheet: View {
                     } else {
                         Image(systemName: "person.3.fill")
                     }
-                    Text(isLoading ? "创建中..." : "创建群聊")
+                    Text(isLoading ? AppLocalization.text("创建中...") : AppLocalization.text("创建群聊"))
                 }
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(groupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.secondary : Color.white)
@@ -854,13 +890,24 @@ private struct ScannerSheet: View {
 
 private struct MyQRCodeSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var authSession: AuthSession
 
     private var userName: String {
-        UserDefaults.standard.string(forKey: "current_user_name") ?? "IMIMChat"
+        authSession.currentUser?.nickname
+            ?? UserDefaults.standard.string(forKey: "current_user_name")
+            ?? "IMIMChat"
     }
 
     private var userId: String {
-        UserDefaults.standard.string(forKey: "current_user_id") ?? "guest"
+        authSession.currentUser?.id
+            ?? UserDefaults.standard.string(forKey: "current_user_id")
+            ?? ""
+    }
+
+    private var account: String {
+        authSession.currentUser?.account
+            ?? UserDefaults.standard.string(forKey: "current_user_account")
+            ?? "未绑定账号"
     }
 
     private var avatar: String? {
@@ -868,7 +915,7 @@ private struct MyQRCodeSheet: View {
     }
 
     private var qrPayload: String {
-        "https://wed.imim.chat/im/user/\(userId)"
+        QRCodeGenerator.userPayload(userId: userId)
     }
 
     var body: some View {
@@ -886,7 +933,7 @@ private struct MyQRCodeSheet: View {
                         Text(userName)
                             .font(.system(size: 21, weight: .semibold))
                             .foregroundStyle(DoveTheme.ink)
-                        Text("IMIM ID: \(userId)")
+                        Text("账号：\(account)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -939,7 +986,19 @@ private struct MyQRCodeSheet: View {
     }
 }
 
-private enum QRCodeGenerator {
+enum QRCodeGenerator {
+    static func userPayload(userId: String) -> String {
+        "imim://user/\(userId)"
+    }
+
+    static func userID(from payload: String) -> String? {
+        let prefix = "imim://user/"
+        guard payload.hasPrefix(prefix) else { return nil }
+        let rawValue = String(payload.dropFirst(prefix.count))
+        let userID = rawValue.removingPercentEncoding ?? rawValue
+        return userID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : userID
+    }
+
     static func makeImage(from string: String) -> UIImage? {
         let context = CIContext()
         let filter = CIFilter.qrCodeGenerator()

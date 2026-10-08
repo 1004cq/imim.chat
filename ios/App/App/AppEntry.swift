@@ -6,6 +6,7 @@ import SwiftUI
 struct imimchatApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @AppStorage("isDarkMode") private var isDarkMode = false
+    @AppStorage(AppLanguage.preferenceKey) private var languagePreference = AppLanguage.system.rawValue
     @StateObject private var authSession = AuthSession()
     @StateObject private var pushManager = PushNotificationManager.shared
 
@@ -16,7 +17,14 @@ struct imimchatApp: App {
             Chat.self,
             Message.self,
         ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
+        // Use a host-specific store so conversations cached for a retired
+        // deployment never appear as contacts in the current environment.
+        // The previous store remains on disk and is not destructively erased.
+        let modelConfiguration = ModelConfiguration(
+            "app.imim.chat",
+            schema: schema,
+            isStoredInMemoryOnly: false
+        )
 
         do {
             return try ModelContainer(for: schema, configurations: [modelConfiguration])
@@ -37,6 +45,7 @@ struct imimchatApp: App {
                 .modelContainer(sharedModelContainer)
                 .environmentObject(authSession)
                 .environmentObject(pushManager)
+                .environment(\.locale, (AppLanguage(rawValue: languagePreference) ?? .system).locale)
                 .preferredColorScheme(isDarkMode ? .dark : .light)
         }
     }
@@ -44,8 +53,10 @@ struct imimchatApp: App {
 
 struct RootView: View {
     @EnvironmentObject private var authSession: AuthSession
+    @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("privacy_biometric_lock") private var biometricLockEnabled = false
+    @AppStorage("privacy_hide_message_previews") private var hideMessagePreviews = false
     @ObservedObject private var appLock = AppLockManager.shared
 
     var body: some View {
@@ -63,10 +74,20 @@ struct RootView: View {
             }
         }
         .onAppear {
+            PushNotificationManager.shared.configure(modelContext: modelContext)
+            IncomingMessagePersistence.shared.configure(modelContext)
+            syncNotificationPreferences()
             appLock.syncProtectionState(isEnabled: biometricLockEnabled)
         }
         .onChange(of: biometricLockEnabled) { _, isEnabled in
             appLock.syncProtectionState(isEnabled: isEnabled)
+        }
+        .onChange(of: hideMessagePreviews) { _, _ in syncNotificationPreferences() }
+        .onChange(of: authSession.currentUser?.id) { _, _ in syncNotificationPreferences() }
+        .alert("账号已注销", isPresented: $authSession.showAccountDeletionNotice) {
+            Button("确定", role: .cancel) {}
+        } message: {
+            AppLocalizedText(authSession.accountDeletionNotice)
         }
         .onChange(of: scenePhase) { _, phase in
             appLock.handle(scenePhase: phase, isEnabled: biometricLockEnabled)
@@ -79,6 +100,10 @@ struct RootView: View {
                 break
             }
         }
+    }
+
+    private func syncNotificationPreferences() {
+        NotificationPreview.syncPreferences(userId: authSession.currentUser?.id, hidden: hideMessagePreviews)
     }
 }
 
@@ -135,7 +160,7 @@ final class AppLockManager: ObservableObject {
         isAuthenticating = true
         context.evaluatePolicy(
             .deviceOwnerAuthenticationWithBiometrics,
-            localizedReason: "使用 Face ID 解锁 IMIM Chat"
+            localizedReason: AppLocalization.string("使用 Face ID 解锁 IMIM Chat")
         ) { [weak self] success, _ in
             Task { @MainActor in
                 guard let self else { return }

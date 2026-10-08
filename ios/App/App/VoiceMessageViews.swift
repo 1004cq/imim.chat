@@ -143,7 +143,7 @@ struct VoiceRecordingOverlay: View {
             )
             .frame(width: 190, height: 34)
 
-            Text(isCancelling ? "松开取消" : "上滑取消  \(format(duration))")
+            Text(isCancelling ? AppLocalization.text("松开取消") : AppLocalization.text("上滑取消  \(format(duration))"))
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(isCancelling ? .red : DoveTheme.ink)
         }
