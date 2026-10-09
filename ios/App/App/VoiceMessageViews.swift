@@ -1,4 +1,105 @@
 import SwiftUI
+import Combine
+
+// MARK: - Chat voice observation (UI projections, no audio or persistence)
+
+/// Owns the existing recorder but forwards only recording start/stop and errors
+/// to the chat screen. Metering and playback stay in their small child views.
+@MainActor
+final class ChatVoiceRecordingState: ObservableObject {
+    let recorder: VoiceRecorderManager
+    private var changes: AnyCancellable?
+
+    convenience init() {
+        self.init(recorder: VoiceRecorderManager())
+    }
+
+    init(recorder: VoiceRecorderManager) {
+        self.recorder = recorder
+        let signals: [AnyPublisher<Void, Never>] = [
+            recorder.$isRecording.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            recorder.$errorMessage.removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher()
+        ]
+        // VoiceRecorderManager publishes only on MainActor. Published emits
+        // before mutation; forwarding objectWillChange preserves that contract.
+        changes = Publishers.MergeMany(signals).sink { [weak self] in
+            self?.objectWillChange.send()
+        }
+    }
+}
+
+struct ChatVoicePlaybackPresentation: Equatable {
+    let isPlaying: Bool
+    let progress: Double
+    static let idle = Self(isPlaying: false, progress: 0)
+
+    static func value(messageId: String, playingId: String?, playing: Bool,
+                      progress: Double) -> Self {
+        guard playingId == messageId else { return .idle }
+        return Self(isPlaying: playing, progress: progress)
+    }
+}
+
+enum ChatVoiceWaveformClock {
+    static func phase(at date: Date, isAnimating: Bool, reduceMotion: Bool) -> Double {
+        guard isAnimating, !reduceMotion else { return 0 }
+        return date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.35) / 0.35 * .pi * 2
+    }
+}
+
+@MainActor
+final class ChatVoicePlaybackState: ObservableObject {
+    @Published private(set) var value: ChatVoicePlaybackPresentation
+    private var changes: AnyCancellable?
+
+    init(recorder: VoiceRecorderManager, messageId: String) {
+        value = .value(messageId: messageId, playingId: recorder.playingMessageId,
+                       playing: recorder.isPlaying, progress: recorder.playbackProgress)
+        changes = Publishers.CombineLatest3(recorder.$playingMessageId,
+                                            recorder.$isPlaying, recorder.$playbackProgress)
+            .map { ChatVoicePlaybackPresentation.value(messageId: messageId,
+                       playingId: $0, playing: $1, progress: $2) }
+            .removeDuplicates()
+            .sink { [weak self] incoming in
+                guard let self, self.value != incoming else { return }
+                self.value = incoming
+            }
+    }
+}
+
+// MARK: - End chat voice observation
+
+@MainActor
+struct ChatVoiceRecordingOverlay: View {
+    @ObservedObject var recorder: VoiceRecorderManager
+
+    var body: some View {
+        VoiceRecordingOverlay(duration: recorder.recordingDuration,
+                              waveform: recorder.liveWaveform,
+                              isCancelling: recorder.isCancelling)
+    }
+}
+
+/// Progress observation belongs to this small child, not the message row or
+/// entire chat. Message identity and all existing playback actions stay intact.
+@MainActor
+struct ChatVoicePlaybackBubble: View {
+    let message: Message
+    let onTap: () -> Void
+    @StateObject private var playback: ChatVoicePlaybackState
+
+    init(message: Message, recorder: VoiceRecorderManager, onTap: @escaping () -> Void) {
+        self.message = message
+        self.onTap = onTap
+        _playback = StateObject(wrappedValue: ChatVoicePlaybackState(
+            recorder: recorder, messageId: message.messageId))
+    }
+
+    var body: some View {
+        VoiceMessageBubble(message: message, isPlaying: playback.value.isPlaying,
+                           progress: playback.value.progress, onTap: onTap)
+    }
+}
 
 struct VoiceMessageBubble: View {
     let message: Message
@@ -88,10 +189,12 @@ struct VoiceWaveformView: View {
     let isAnimating: Bool
     let tint: Color
 
-    @State private var phase = 0.0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 0.08, paused: !isAnimating)) { _ in
+        TimelineView(.animation(minimumInterval: 0.08, paused: !isAnimating || reduceMotion)) { context in
+            let phase = ChatVoiceWaveformClock.phase(at: context.date,
+                isAnimating: isAnimating, reduceMotion: reduceMotion)
             GeometryReader { proxy in
                 let width = proxy.size.width
                 let height = proxy.size.height
@@ -101,7 +204,7 @@ struct VoiceWaveformView: View {
                 HStack(alignment: .center, spacing: spacing) {
                     ForEach(samples.indices, id: \.self) { index in
                         let normalized = max(0.08, min(1, samples[index]))
-                        let wave = isAnimating ? 0.16 * sin(Double(index) * 0.72 + phase) : 0
+                        let wave = isAnimating && !reduceMotion ? 0.16 * sin(Double(index) * 0.72 + phase) : 0
                         let barHeight = max(4, height * CGFloat(max(0.08, min(1, normalized + wave))))
                         let played = Double(index) / Double(max(1, samples.count - 1)) <= progress
 
@@ -111,14 +214,6 @@ struct VoiceWaveformView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .onAppear { phase += 0.5 }
-        .onChange(of: isAnimating) { _, newValue in
-            if newValue {
-                withAnimation(.linear(duration: 0.35).repeatForever(autoreverses: false)) {
-                    phase += .pi * 2
-                }
             }
         }
     }

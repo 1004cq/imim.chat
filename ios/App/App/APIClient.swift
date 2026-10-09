@@ -38,7 +38,7 @@ class APIClient {
             request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ProxySession.shared.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
@@ -478,7 +478,7 @@ class APIClient {
         }
         body.append("--\(boundary)--\r\n")
 
-        let (data, response) = try await URLSession.shared.upload(for: request, from: body)
+        let (data, response) = try await ProxySession.shared.upload(for: request, from: body)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }
@@ -702,7 +702,7 @@ class APIClient {
         )
         body.append("--\(boundary)--\r\n")
 
-        let (responseData, response) = try await URLSession.shared.upload(for: request, from: body)
+        let (responseData, response) = try await ProxySession.shared.upload(for: request, from: body)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }
@@ -756,7 +756,7 @@ class APIClient {
         )
 
         await progress(0.15)
-        let (responseData, response) = try await URLSession.shared.upload(for: request, from: body)
+        let (responseData, response) = try await ProxySession.shared.upload(for: request, from: body)
         await progress(0.9)
 
         guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
@@ -1330,7 +1330,7 @@ private actor MomentMediaTypeResolver {
         request.httpMethod = "HEAD"
         request.timeoutInterval = 10
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await ProxySession.shared.data(for: request)
             try Task.checkCancellation()
             guard let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode),

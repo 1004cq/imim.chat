@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C0DE66000000000000000001 /* ProxySession.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE66000000000000000003; };
+		C0DE66000000000000000002 /* ProxySettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE66000000000000000004; };
 		C0DE62000000000000000001 /* AppLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE62000000000000000003; };
 		C0DE62000000000000000002 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = C0DE62000000000000000004; };
 		C0DE62000000000000000005 /* InfoPlist.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = C0DE62000000000000000006; };
@@ -91,6 +93,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		C0DE66000000000000000003 /* ProxySession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxySession.swift; sourceTree = "<group>"; };
+		C0DE66000000000000000004 /* ProxySettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxySettingsView.swift; sourceTree = "<group>"; };
 		C0DE62000000000000000003 /* AppLocalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLocalization.swift; sourceTree = "<group>"; };
 		C0DE62000000000000000004 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		C0DE62000000000000000006 /* InfoPlist.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = InfoPlist.xcstrings; sourceTree = "<group>"; };
@@ -226,6 +230,8 @@
 				C0DE00000000000000000008 /* DiscoveryView.swift */,
 				C0DE00000000000000000009 /* ProfileView.swift */,
 				C0DE0000000000000000000A /* APIClient.swift */,
+				C0DE66000000000000000003 /* ProxySession.swift */,
+				C0DE66000000000000000004 /* ProxySettingsView.swift */,
 				C0DE0000000000000000000B /* SocketManager.swift */,
 				C0DE0000000000000000000D /* SettingsView.swift */,
 				C0DE0000000000000000000E /* ChatsViewModel.swift */,
@@ -483,6 +489,8 @@
 				C0DE00000000000000000028 /* DiscoveryView.swift in Sources */,
 				C0DE00000000000000000029 /* ProfileView.swift in Sources */,
 				C0DE0000000000000000002A /* APIClient.swift in Sources */,
+				C0DE66000000000000000001 /* ProxySession.swift in Sources */,
+				C0DE66000000000000000002 /* ProxySettingsView.swift in Sources */,
 				C0DE0000000000000000002B /* SocketManager.swift in Sources */,
 				C0DE0000000000000000002D /* SettingsView.swift in Sources */,
 				C0DE0000000000000000002E /* ChatsViewModel.swift in Sources */,
@@ -669,7 +677,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = App/App.Debug.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 65;
+				CURRENT_PROJECT_VERSION = 67;
 				DEVELOPMENT_TEAM = 4U332QFN6D;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.6;
@@ -696,7 +704,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 65;
+				CURRENT_PROJECT_VERSION = 67;
 				DEVELOPMENT_TEAM = 4U332QFN6D;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.6;
@@ -720,7 +728,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = NotificationService/NotificationService.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 65;
+				CURRENT_PROJECT_VERSION = 67;
 				DEVELOPMENT_TEAM = 4U332QFN6D;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = NotificationService/Info.plist;
@@ -748,7 +756,7 @@
 				CODE_SIGN_ENTITLEMENTS = NotificationService/NotificationService.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 65;
+				CURRENT_PROJECT_VERSION = 67;
 				DEVELOPMENT_TEAM = 4U332QFN6D;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = NotificationService/Info.plist;

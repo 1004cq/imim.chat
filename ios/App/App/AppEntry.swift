@@ -42,6 +42,7 @@ struct imimchatApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
+                .modifier(ProxyImportRouting())
                 .modelContainer(sharedModelContainer)
                 .environmentObject(authSession)
                 .environmentObject(pushManager)

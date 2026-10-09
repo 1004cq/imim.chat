@@ -4,14 +4,16 @@ import PhotosUI
 import UniformTypeIdentifiers
 import Kingfisher
 import AVKit
+import ImageIO
 
 struct ChatDetailView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let chat: Chat
 
     @StateObject private var viewModel = ChatDetailViewModel()
-    @StateObject private var voiceRecorder = VoiceRecorderManager()
+    @StateObject private var voiceState = ChatVoiceRecordingState()
     @ObservedObject private var socket = SocketManager.shared
     @FocusState private var isInputFocused: Bool
     @State private var activeCallSession: VideoCallSession?
@@ -22,6 +24,8 @@ struct ChatDetailView: View {
     @State private var isFileImporterPresented = false
     @State private var didPerformInitialScroll = false
     @State private var isNearMessageBottom = true
+    @State private var isUserScrollingMessages = false
+    @State private var bottomScrollPolicy = ChatBottomScrollPolicy()
     @State private var isShowingMediaPanel = false
     @State private var isShowingVanishDurationPicker = false
     @State private var composerInsertion: ComposerInsertion?
@@ -32,6 +36,8 @@ struct ChatDetailView: View {
     @State private var unlockError: String?
 
     private let mediaAndCallEnabled = true
+
+    private var voiceRecorder: VoiceRecorderManager { voiceState.recorder }
 
     private var messages: [Message] {
         viewModel.sortedMessages(for: chat)
@@ -49,11 +55,7 @@ struct ChatDetailView: View {
             }
 
             if voiceRecorder.isRecording {
-                VoiceRecordingOverlay(
-                    duration: voiceRecorder.recordingDuration,
-                    waveform: voiceRecorder.liveWaveform,
-                    isCancelling: voiceRecorder.isCancelling
-                )
+                ChatVoiceRecordingOverlay(recorder: voiceRecorder)
                 .transition(.scale(scale: 0.92).combined(with: .opacity))
             }
 
@@ -86,6 +88,8 @@ struct ChatDetailView: View {
             viewModel.markAsRead(chat, modelContext: modelContext)
         }
         .onDisappear {
+            bottomScrollPolicy.cancel()
+            isUserScrollingMessages = false
             if chat.type == "group" { SocketManager.shared.leaveGroup(chat.chatId) }
             if NotificationRouter.shared.activeConversationId == chat.chatId {
                 NotificationRouter.shared.setActiveConversation(nil)
@@ -338,6 +342,10 @@ struct ChatDetailView: View {
                     }
                 )
                 .scrollDismissesKeyboard(.interactively)
+                .modifier(ChatUserScrollTracking { isScrolling in
+                    isUserScrollingMessages = isScrolling
+                    if isScrolling { bottomScrollPolicy.cancel() }
+                })
                 .onAppear {
                     performInitialScrollIfNeeded(proxy: proxy, messageItems: messageItems)
                 }
@@ -350,13 +358,13 @@ struct ChatDetailView: View {
                           }) == true,
                           let lastMessage = messageItems.last,
                           lastMessage.isOutgoing || isNearMessageBottom else { return }
-                    scheduleScrollToBottom(proxy: proxy, animated: true)
+                    scheduleScrollToBottom(proxy: proxy, reason: lastMessage.isOutgoing ? .outgoing : .incoming)
                 }
                 .onChange(of: viewModel.isLoadingMessages) { _, isLoading in
                     guard !isLoading else { return }
                     if didPerformInitialScroll {
                         if isNearMessageBottom {
-                            scheduleScrollToBottom(proxy: proxy, animated: false)
+                            scheduleScrollToBottom(proxy: proxy, reason: .historyLoaded)
                         }
                     } else {
                         performInitialScrollIfNeeded(proxy: proxy, messageItems: messageItems)
@@ -376,11 +384,7 @@ struct ChatDetailView: View {
     private func performInitialScrollIfNeeded(proxy: ScrollViewProxy, messageItems: [Message]) {
         guard !didPerformInitialScroll, !messageItems.isEmpty else { return }
         didPerformInitialScroll = true
-        DispatchQueue.main.async {
-            withAnimation(nil) {
-                proxy.scrollTo(Self.messageBottomAnchorId, anchor: .bottom)
-            }
-        }
+        scheduleScrollToBottom(proxy: proxy, reason: .initial)
     }
 
     private static let messageBottomAnchorId = "chat-message-bottom-anchor"
@@ -646,14 +650,23 @@ struct ChatDetailView: View {
                 proxy.scrollTo(Self.messageBottomAnchorId, anchor: .bottom)
             }
         } else {
-            proxy.scrollTo(Self.messageBottomAnchorId, anchor: .bottom)
+            withAnimation(nil) {
+                proxy.scrollTo(Self.messageBottomAnchorId, anchor: .bottom)
+            }
         }
     }
 
-    private func scheduleScrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+    private func scheduleScrollToBottom(proxy: ScrollViewProxy, reason: ChatBottomScrollPolicy.Reason) {
+        guard let ticket = bottomScrollPolicy.request(
+            reason, isNearBottom: isNearMessageBottom, isUserScrolling: isUserScrollingMessages
+        ) else { return }
         // Defer one run-loop turn so the bottom anchor reflects the newly
-        // inserted message before changing the scroll position.
+        // inserted message. Coalesce requests and recheck the current UI state:
+        // an incoming-message callback must not override a new user scroll.
         DispatchQueue.main.async {
+            guard let animated = bottomScrollPolicy.consume(
+                ticket, isUserScrolling: isUserScrollingMessages, reduceMotion: reduceMotion
+            ) else { return }
             scrollToBottom(proxy: proxy, animated: animated)
         }
     }
@@ -989,7 +1002,7 @@ private struct MessageBubble: View {
     let peerAvatar: String?
     let peerUserId: String?
     let isForwardingRestricted: Bool
-    @ObservedObject var voiceRecorder: VoiceRecorderManager
+    let voiceRecorder: VoiceRecorderManager
     let onReply: () -> Void
     let onMention: () -> Void
     let onRecall: () -> Void
@@ -1081,10 +1094,9 @@ private struct MessageBubble: View {
     private var bubbleContent: some View {
         Group {
             if message.type == "voice" {
-                VoiceMessageBubble(
+                ChatVoicePlaybackBubble(
                     message: message,
-                    isPlaying: voiceRecorder.playingMessageId == message.messageId && voiceRecorder.isPlaying,
-                    progress: voiceRecorder.playingMessageId == message.messageId ? voiceRecorder.playbackProgress : 0
+                    recorder: voiceRecorder
                 ) {
                     if let url = CQIMMediaURL.resolve(message.voiceURL), url.isFileURL {
                         voiceRecorder.togglePlayback(messageId: message.messageId, urlString: url.absoluteString)
@@ -1134,7 +1146,8 @@ private struct MessageBubble: View {
     }
 
     private var baseTextBubble: some View {
-        Text(message.content)
+        Text(ProxyMessageLinks.attributed(message.content))
+            .tint(.blue)
             .font(.system(size: 14.5 * chatTextScale))
             .lineSpacing(2)
             .foregroundStyle(DoveTheme.ink)
@@ -1305,10 +1318,25 @@ private struct HeaderIconButton: View {
 private struct AuthenticatedRemoteImage<Failure: View>: View {
     let url: URL
     var contentMode: SwiftUI.ContentMode = .fill
+    var targetSize = CGSize(width: 190, height: 140)
     @ViewBuilder var failure: () -> Failure
 
+    @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
     @State private var didFail = false
+
+    private struct DecodeRequest: Equatable {
+        let url: URL
+        let pixels: CGSize
+        let fill: Bool
+    }
+
+    private var decodeRequest: DecodeRequest {
+        DecodeRequest(url: url,
+                      pixels: CGSize(width: targetSize.width * displayScale,
+                                     height: targetSize.height * displayScale),
+                      fill: contentMode == .fill)
+    }
 
     var body: some View {
         Group {
@@ -1322,48 +1350,113 @@ private struct AuthenticatedRemoteImage<Failure: View>: View {
                 ProgressView()
             }
         }
-        .task(id: url) {
-            await load()
+        .task(id: decodeRequest) {
+            await load(decodeRequest)
         }
+        .onDisappear { image = nil }
     }
 
-    private func load() async {
+    private func load(_ input: DecodeRequest) async {
+        guard !Task.isCancelled else { return }
         image = nil
         didFail = false
 
-        if url.isFileURL {
-            do {
-                let data = try Data(contentsOf: url)
-                guard let uiImage = UIImage(data: data) else {
-                    didFail = true
-                    return
-                }
-                image = uiImage
-            } catch {
-                didFail = true
-            }
-            return
-        }
-
-        var request = URLRequest(url: url)
-        if let token = AuthTokenStore.shared.token, url.path.hasPrefix("/api/") {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode),
-                  let uiImage = UIImage(data: data) else {
-                didFail = true
-                return
+            let thumbnail: CGImage
+            if input.url.isFileURL {
+                thumbnail = try await ChatImageDecoder.shared.decode(
+                    fileURL: input.url, targetPixels: input.pixels, fill: input.fill)
+            } else {
+                var request = URLRequest(url: input.url)
+                if let token = AuthTokenStore.shared.token, input.url.path.hasPrefix("/api/") {
+                    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                }
+                let (data, response) = try await URLSession.shared.data(for: request)
+                try Task.checkCancellation()
+                guard let http = response as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode) else {
+                    throw ChatImageDecoder.DecodeError.invalidImage
+                }
+                thumbnail = try await ChatImageDecoder.shared.decode(
+                    data: data, targetPixels: input.pixels, fill: input.fill)
             }
-            image = uiImage
+            // A disappearing/reused view must never publish an obsolete result.
+            try Task.checkCancellation()
+            image = UIImage(cgImage: thumbnail, scale: max(1, displayScale), orientation: .up)
         } catch {
+            guard !Task.isCancelled, !(error is CancellationError) else { return }
             didFail = true
         }
     }
 }
+
+// MARK: - Chat image decoder (isolated, no persistent plaintext cache)
+
+/// Serial decoding bounds concurrent raster allocations and keeps file access
+/// and ImageIO work off MainActor. Only the displayed thumbnail crosses back.
+actor ChatImageDecoder {
+    static let shared = ChatImageDecoder()
+    enum DecodeError: Error { case invalidImage, invalidTarget }
+
+    func decode(fileURL: URL, targetPixels: CGSize, fill: Bool) throws -> CGImage {
+        try Task.checkCancellation()
+        guard fileURL.isFileURL else { throw DecodeError.invalidImage }
+        return try autoreleasepool {
+            guard let source = CGImageSourceCreateWithURL(fileURL as CFURL,
+                [kCGImageSourceShouldCache: false] as CFDictionary) else {
+                throw DecodeError.invalidImage
+            }
+            return try thumbnail(source: source, targetPixels: targetPixels, fill: fill)
+        }
+    }
+
+    func decode(data: Data, targetPixels: CGSize, fill: Bool) throws -> CGImage {
+        try Task.checkCancellation()
+        return try autoreleasepool {
+            guard let source = CGImageSourceCreateWithData(data as CFData,
+                [kCGImageSourceShouldCache: false] as CFDictionary) else {
+                throw DecodeError.invalidImage
+            }
+            return try thumbnail(source: source, targetPixels: targetPixels, fill: fill)
+        }
+    }
+
+    private func thumbnail(source: CGImageSource, targetPixels: CGSize, fill: Bool) throws -> CGImage {
+        #if CHAT_IMAGE_DECODER_TESTS
+        precondition(!Thread.isMainThread, "Image decoding must leave the UI thread")
+        #endif
+        guard targetPixels.width.isFinite, targetPixels.height.isFinite,
+              targetPixels.width > 0, targetPixels.height > 0 else { throw DecodeError.invalidTarget }
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let rawWidth = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let rawHeight = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
+            throw DecodeError.invalidImage
+        }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let rotated = (5...8).contains(orientation)
+        let width = rotated ? rawHeight.doubleValue : rawWidth.doubleValue
+        let height = rotated ? rawWidth.doubleValue : rawHeight.doubleValue
+        guard width.isFinite, height.isFinite, width > 0, height > 0 else { throw DecodeError.invalidImage }
+        let x = Double(targetPixels.width) / width
+        let y = Double(targetPixels.height) / height
+        // Retain aspect-fill detail, but cap extreme aspect ratios / oversized
+        // targets to a 4096px edge and four-megapixel thumbnail raster budget.
+        let scale = min(1, fill ? max(x, y) : min(x, y),
+                        4096 / max(width, height), sqrt(4_000_000 / width / height))
+        let maxPixelSize = max(1, Int(floor(max(width, height) * scale)))
+        try Task.checkCancellation()
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary) else { throw DecodeError.invalidImage }
+        try Task.checkCancellation()
+        return image
+    }
+}
+
+// MARK: - End chat image decoder
 
 private struct PresenceDot: View {
     let isOnline: Bool
@@ -1387,6 +1480,75 @@ private extension Date {
             return AppLocalization.text("昨天 \(time)")
         }
         return formatted(.dateTime.month().day().hour().minute().locale(AppLanguage.current.locale))
+    }
+}
+
+// MARK: - Bottom scroll policy (value-only, no messages or persistence)
+
+/// Owned by ChatDetailView's UI state. A single deferred callback can serve a
+/// burst of requests; obsolete callbacks cannot consume a newer request.
+struct ChatBottomScrollPolicy {
+    enum Reason: Int {
+        case historyLoaded, incoming, outgoing, initial
+
+        var requiresNearBottom: Bool { self == .historyLoaded || self == .incoming }
+        var animated: Bool { self == .incoming || self == .outgoing }
+    }
+
+    private var generation: UInt64 = 0
+    private var pending: (ticket: UInt64, reason: Reason)?
+
+    mutating func request(_ reason: Reason, isNearBottom: Bool, isUserScrolling: Bool) -> UInt64? {
+        guard !isUserScrolling, !reason.requiresNearBottom || isNearBottom else { return nil }
+        if let current = pending {
+            if reason.rawValue > current.reason.rawValue {
+                pending = (current.ticket, reason)
+            }
+            return nil
+        }
+        generation &+= 1
+        pending = (generation, reason)
+        return generation
+    }
+
+    mutating func cancel() {
+        pending = nil
+    }
+
+    /// nil = no scroll; false = immediate; true = animated. User intent is
+    /// rechecked at delivery. Near-bottom eligibility belongs to admission:
+    /// newly appended tall media can move the bottom out of range by itself.
+    /// Never enqueue a replay after user drag.
+    mutating func consume(_ ticket: UInt64, isUserScrolling: Bool, reduceMotion: Bool) -> Bool? {
+        guard let current = pending, current.ticket == ticket else { return nil }
+        pending = nil
+        guard !isUserScrolling else { return nil }
+        return current.reason.animated && !reduceMotion
+    }
+}
+
+// MARK: - End bottom scroll policy
+
+private struct ChatUserScrollTracking: ViewModifier {
+    let changed: (Bool) -> Void
+    @GestureState private var isDragging = false
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { _, phase in
+                // Programmatic .animating is not a user gesture; include inertia
+                // so incoming messages cannot interrupt a user's deceleration.
+                changed(phase == .tracking || phase == .interacting || phase == .decelerating)
+            }
+        } else {
+            // iOS 17 lacks scroll phases. Observe touch drag simultaneously;
+            // GestureState also resets on cancellation. Do not replace scrolling.
+            content
+                .simultaneousGesture(DragGesture().updating($isDragging) { _, dragging, _ in
+                    dragging = true
+                })
+                .onChange(of: isDragging) { _, dragging in changed(dragging) }
+        }
     }
 }
 

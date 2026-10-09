@@ -49,3 +49,51 @@ Apple profiling source: [Optimize SwiftUI performance with Instruments](https://
 Rechecked the pinned `AvatarNode.swift:766–777` cached-image / subsequent main-queue delivery excerpt. imimchat already implements the equivalent cache-first/replace-later policy using Kingfisher; A3 does not transplant Telegram's media cache or promise fully asynchronous cold rendering.
 
 Actual-source Catalyst measurements identified repeated fallback-image drawing and per-byte SHA256 hexadecimal formatting. A3 independently reuses only generated fallback bitmaps in a bounded MainActor NSCache, keyed by initial/group/size/renderer scale/appearance traits/language. It replaces String(format:) hex encoding with byte lookup without changing SHA256 or persisted digest text. Peer images remain solely in the existing Kingfisher cache. The synchronous disk first-frame path, prefetch scheduler, stale guards, network request semantics and public APIs are unchanged. No Telegram source/assets were copied.
+
+## B1 — bounded scroll-intent policy, 2026-10-09
+
+Reverified the clean local official reference at the same pinned commit.
+[PreparedChatHistoryViewTransition.swift lines 84–110](https://github.com/TelegramMessenger/Telegram-iOS/blob/6ad963e5b62d354da79040f388ae2b9132fb17b8/submodules/TelegramUI/Sources/PreparedChatHistoryViewTransition.swift#L84-L110)
+separates initial/interactive/reload reasons and stationary ranges from scroll
+targets. [ListView.swift lines 2123–2128](https://github.com/TelegramMessenger/Telegram-iOS/blob/6ad963e5b62d354da79040f388ae2b9132fb17b8/submodules/Display/Source/ListView.swift#L2123-L2128)
+applies a stationary offset separately from explicit position correction.
+These are mechanism references only, not proof that Telegram implements this
+App's callback-ticket policy or that its entire scroll engine was audited.
+
+imimchat retains SwiftUI ScrollViewReader and its existing rows. B1 independently
+coalesces delayed bottom-follow requests and invalidates them when user scroll
+starts/view disappears; it does not copy Telegram's list engine or implement
+historical-insertion offset preservation.
+
+Apple references: [native scroll phases](https://developer.apple.com/documentation/swiftui/view/onscrollphasechange(_:)-1k12m)
+and [Reduce Motion environment](https://developer.apple.com/documentation/swiftui/environmentvalues/accessibilityreducemotion).
+Installed Xcode SDK interfaces confirm iOS 18 availability; iOS 17 keeps a
+simultaneous touch-drag fallback with its documented inertia limitation.
+
+## D1 / B2 — thumbnails and local voice updates, 2026-10-09
+
+Official checkout remains pinned at `6ad963e5b62d354da79040f388ae2b9132fb17b8`.
+Inspected [DirectMediaImageCache.swift:291–315](https://github.com/TelegramMessenger/Telegram-iOS/blob/6ad963e5b62d354da79040f388ae2b9132fb17b8/submodules/DirectMediaImageCache/Sources/DirectMediaImageCache.swift#L291-L315):
+it draws a size-specific aspect-filled representation and disposes fetch/data
+subscriptions. This excerpt uses UIImage plus DrawingContext and stores to its
+media box; it does not show ImageIO downsampling. imimchat independently uses
+ImageIO on a serial actor, passes only thumbnail CGImage back to MainActor, and
+creates no persistent plaintext thumbnail cache. The mechanism reference is
+bounded display-size work plus cancellation, not identical code/cache design.
+
+Inspected [ChatMessageInteractiveFileNode.swift:148–178](https://github.com/TelegramMessenger/Telegram-iOS/blob/6ad963e5b62d354da79040f388ae2b9132fb17b8/submodules/TelegramUI/Components/Chat/ChatMessageInteractiveFileNode/Sources/ChatMessageInteractiveFileNode.swift#L148-L178),
+[275–280](https://github.com/TelegramMessenger/Telegram-iOS/blob/6ad963e5b62d354da79040f388ae2b9132fb17b8/submodules/TelegramUI/Components/Chat/ChatMessageInteractiveFileNode/Sources/ChatMessageInteractiveFileNode.swift#L275-L280)
+and [1431–1462](https://github.com/TelegramMessenger/Telegram-iOS/blob/6ad963e5b62d354da79040f388ae2b9132fb17b8/submodules/TelegramUI/Components/Chat/ChatMessageInteractiveFileNode/Sources/ChatMessageInteractiveFileNode.swift#L1431-L1462):
+playback status/timer and audio-level subscriptions are node-local, delivered on
+the main queue; visibility stops blob animation, deinit disposes subscriptions.
+imimchat retains Combine/SwiftUI and its existing audio manager: start/stop/errors
+update the screen, recording meters update an overlay child, only the matching
+voice presentation publishes playback progress. Its existing TimelineView now
+drives a finite phase while active and pauses for stop/Reduce Motion, without
+retaining a repeatForever animation. It does not import Telegram nodes/timers
+or claim the same renderer or visibility implementation.
+
+Apple sources: [iOS Memory Deep Dive — ImageIO downsampling](https://developer.apple.com/videos/play/wwdc2018/416/)
+and [immediate image source cache/decode option](https://developer.apple.com/documentation/imageio/kcgimagesourceshouldcacheimmediately).
+Only the excerpts above were inspected; no Telegram source/assets were copied
+and no Telegram build scripts/services were run.

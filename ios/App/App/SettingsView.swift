@@ -240,6 +240,17 @@ struct SettingsView: View {
                 }
             }
 
+            SettingsSection(title: ProxyCopy.text("数据和网络", "Data and network")) {
+                SettingsCard {
+                    NavigationLink {
+                        ProxySettingsView()
+                    } label: {
+                        SettingsRowContent(title: ProxyCopy.text("代理服务器", "Proxy"), systemImage: "network", tint: .blue)
+                    }
+                    .buttonStyle(SettingsPressButtonStyle())
+                }
+            }
+
             SettingsSection(title: "支持") {
                 SettingsCard {
                     NavigationLink {

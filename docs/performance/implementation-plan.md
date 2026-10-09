@@ -55,6 +55,60 @@ Before change: the actual-source Catalyst prefetch harness passed 19 checks plus
 
 B: chat-history insertion + visible anchor preservation; C: keyboard/emoji/sticker state and insets; D: media dimensions/thumbnail/cover/finite prefetch; E: interruptible tab gestures/animations. Each needs its own source mapping and baseline before changes. No broad UIKit/AsyncDisplayKit migration is authorized.
 
+## B1 — deferred bottom-follow intent, 2026-10-09
+
+Owner requested continued Telegram-reference optimization. The next bounded
+change is in `ChatDetailView.swift`, not encryption/persistence or history loading.
+The pinned Telegram transition excerpts distinguish initial/interactive/reload
+intent and carry stationary ranges separately from explicit scroll targets.
+imimchat's current deferred `scrollTo` callback checked near-bottom at scheduling
+but did not check user interaction at delivery, and queued every request.
+
+B1 independently implements a view-owned, value-only pending-scroll policy:
+coalesce a pending burst, preserve stronger initial/outgoing intent, cancel when
+user scrolling starts or the view disappears, reject obsolete callback tickets,
+and respect Reduce Motion. Incoming/history eligibility is checked when requested;
+it is not rechecked using content-induced bottom geometry at delivery, because a
+tall appended media row itself changes that geometry. User intent is rechecked.
+
+iOS 18+ uses the native scroll phase callback for tracking/interacting/decelerating,
+excluding programmatic animating. iOS 17 simultaneously observes touch drag with
+GestureState (including cancellation reset); it cannot identify inertial scrolling
+through that fallback. Keep the existing non-lazy VStack, stable message IDs,
+100-point near-bottom threshold, single sorted render snapshot and action targets.
+No new historical-insertion offset anchoring is claimed or implemented by B1.
+
+Acceptance: actual policy compiled with Swift 6 complete strict concurrency,
+admission/delivery/cancellation/coalescing/priority/motion regressions, source-level
+integration guards, original A1/A2 regressions and full unsigned iOS Release build.
+Runtime offset and hitch validation on approved fixture data remains necessary.
+
+## D1 / B2 — bounded media and observation work, 2026-10-09
+
+Owner requested maximum further optimization. First remove the concrete MainActor
+file read / full-original UIImage decode in the 190x140 chat thumbnail. Use a
+serial actor and ImageIO thumbnail transform, target display pixels, cap extreme
+rasters, check cancellation before/after decode and before UI publication. Keep
+existing media decryption/authentication, retry UI and dimensions; do not add a
+plaintext disk cache or change avatars' instant-cache contract. An isolated
+strict Swift 6 test exercises actual production decoder source with synthetic
+JPEG/PNG/rotation/invalid/cancellation fixtures; report raster bytes, not FPS/RSS.
+Build this change before the next observation refactor.
+
+Next inspect the broad VoiceRecorderManager observation: playback progress must
+not invalidate the whole chat or text/image rows. Use UI-only filtered recording
+observation at the owner and per-message playback presentation at the voice
+child. Move recording meters into the recording overlay; the screen owner only
+needs start/stop and errors, not every waveform/duration/cancel-state tick.
+Do not change recording/playback, sessions or persistence. Test actual
+publisher filters with isolated fixtures and compile the full App. Real-device
+scroll/frame and audible playback proof are separate from publisher counts.
+After B2 compilation, remove the waveform's state-driven repeatForever loop.
+Drive phase from the existing paused TimelineView date instead, also pausing for
+Reduce Motion. Stop/restart must not accumulate repeating animations; preserve
+bar layout, colors, progress and 0.35-second wave period. Include actual phase
+function and View source guards in the voice harness, then rebuild final source.
+
 ## Device verification matrix
 
 Use dedicated synthetic/approved test data, not owner private conversations; an isolated in-memory ModelContainer/test target may be proposed, but do not seed or erase the owner's store. No automatic production API calls.

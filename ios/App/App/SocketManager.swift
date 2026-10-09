@@ -8,6 +8,8 @@ class SocketManager: NSObject, ObservableObject {
     @Published var lastReceivedMessage: Message?
 
     private var webSocketTask: URLSessionWebSocketTask?
+    private var connectAttempt = UUID()
+    private var proxyObserver: NSObjectProtocol?
     private var url: URL {
         var components = URLComponents(string: AppServer.signalURL)!
         let token = AuthTokenStore.shared.token
@@ -27,6 +29,10 @@ class SocketManager: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        proxyObserver = NotificationCenter.default.addObserver(forName: .imimProxySessionDidChange,
+            object: nil, queue: .main) { [weak self] _ in
+                self?.connect()
+            }
     }
 
     func connect() {
@@ -37,11 +43,26 @@ class SocketManager: NSObject, ObservableObject {
 
         reconnectEnabled = true
         closeConnection()
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: OperationQueue())
-        webSocketTask = session.webSocketTask(with: url)
-        webSocketTask?.resume()
-        receiveMessage()
-        startPinging()
+        let attempt = connectAttempt
+        let endpoint = url
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let task = try await ProxySession.shared.webSocketTask(with: endpoint)
+                guard self.connectAttempt == attempt, self.reconnectEnabled, !self.isBackgrounded else {
+                    task.cancel(with: .goingAway, reason: nil)
+                    return
+                }
+                task.delegate = self
+                self.webSocketTask = task
+                task.resume()
+                self.receiveMessage()
+                self.startPinging()
+            } catch {
+                guard self.connectAttempt == attempt else { return }
+                self.isConnected = false
+            }
+        }
     }
 
     func disconnect() {
@@ -189,12 +210,12 @@ class SocketManager: NSObject, ObservableObject {
                     break
                 }
                 self.receiveMessage() // 继续监听
-            case .failure(let error):
-                print("WebSocket 接收失败: \(error)")
+            case .failure:
                 DispatchQueue.main.async {
+                    guard self.webSocketTask === task, !self.isBackgrounded else { return }
                     self.isConnected = false
+                    self.scheduleReconnect()
                 }
-                self.scheduleReconnect()
             }
         }
     }
@@ -399,16 +420,19 @@ class SocketManager: NSObject, ObservableObject {
     private func startPinging() {
         pingTimer?.invalidate()
         pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.webSocketTask?.sendPing { error in
-                if let error = error {
-                    print("WebSocket Ping 失败: \(error)")
-                    self?.isConnected = false
+            guard let task = self?.webSocketTask else { return }
+            task.sendPing { [weak self] error in
+                guard error != nil else { return }
+                DispatchQueue.main.async {
+                    guard let self, self.webSocketTask === task, !self.isBackgrounded else { return }
+                    self.isConnected = false
                 }
             }
         }
     }
 
     private func closeConnection() {
+        connectAttempt = UUID()
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
@@ -634,10 +658,11 @@ extension SocketManager: URLSessionWebSocketDelegate {
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        for groupId in groupSubscriptions {
-            sendJSON(["type": "group_join", "payload": ["groupId": groupId]])
-        }
         DispatchQueue.main.async {
+            guard self.webSocketTask === webSocketTask, !self.isBackgrounded else { return }
+            for groupId in self.groupSubscriptions {
+                self.sendJSON(["type": "group_join", "payload": ["groupId": groupId]])
+            }
             self.isConnected = true
             print("WebSocket 已连接")
         }
@@ -645,6 +670,7 @@ extension SocketManager: URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         DispatchQueue.main.async {
+            guard self.webSocketTask === webSocketTask else { return }
             self.isConnected = false
             print("WebSocket 已关闭")
         }

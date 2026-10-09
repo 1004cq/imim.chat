@@ -130,3 +130,136 @@ Artifacts: `/Users/mima1234/Library/Developer/CodexReleases/imim-listA3.IQKIAk` 
 ### Limits / next evidence
 
 Paired iPhone still reports offline. UIKit Catalyst regression is not a device visual/performance trace. The main-actor synchronous disk image read/decode path remains as before to preserve the disk-hit first-frame contract; async-only replacement needs an explicit cold-frame tradeoff decision and profiling. No install, archive/upload, build bump, App Store review action, server mutation or Git commit/push occurred. Existing uploaded Build 64 and submitted Build 63 remain unchanged and do not include A2/A3.
+
+## B1 implementation — further optimization requested 2026-10-09
+
+Only production `ios/App/App/ChatDetailView.swift` changed in this turn.
+The existing main-queue-delayed bottom scroll now passes through a view-owned
+value-only policy. Requests pending before the next delivery are coalesced;
+initial positioning takes precedence and stays nonanimated, outgoing intent
+retains its existing ability to jump from history. Incoming/history requests
+are admitted only near bottom. User scrolling cancels pending work, and delivery
+rechecks user interaction/ticket identity. View disappearance cancels pending work.
+Reduce Motion disables this automatic scroll animation.
+
+Native iOS 18+ phases include tracking/interacting/decelerating but not
+programmatic animating. The iOS 17 fallback observes simultaneous touch drag via
+GestureState; it does not detect post-release inertia. No new UIKit list engine,
+history pagination or pixel-offset anchoring is introduced. The non-lazy VStack,
+domain message IDs, row action targets, existing sorted snapshot and 100-point
+near-bottom threshold remain unchanged. No message/content/persistence cache exists
+in the policy.
+
+### Verified
+
+- `bash ios/App/scripts/run-chat-bottom-scroll-regression.sh`: **151 checks passed**
+  with the actual policy extracted from the production source, compiled using
+  Swift 6 and complete strict concurrency. No replacement policy or owner data.
+- Admission/delivery timing, canceled/stale callbacks, initial/outgoing priority,
+  no automatic replay after drag, repeated requests and Reduce Motion are covered.
+  Source assertions verify the actual View's wiring, cancellation, phases/fallback,
+  unchanged stable IDs/VStack and sorted-message call. These source assertions are
+  not an end-to-end SwiftUI gesture test.
+- A synthetic 1000-request burst before delivery admits **one** callback, rather
+  than the old scheduler's one unconditional queued action per call. This is
+  policy behavior, not actual network throughput, frame/hitch/FPS measurement.
+- Appended tall media can itself move the bottom outside the threshold. Delivery
+  therefore rechecks user intent rather than wrongly rejecting an already-admitted
+  request merely because new content increased bottom geometry.
+- Original conversation/localization harness: **37 checks passed**; original
+  formatter harness: **5,832 checks passed**. Their synthetic timings are not used
+  as B1 performance evidence.
+- Final full `App.xcworkspace` / `App` / unsigned Release / generic iOS build:
+  **BUILD SUCCEEDED**. Existing AppIntents metadata extraction warning remains;
+  no new ChatDetailView compiler diagnostic was observed.
+- ChatDetailViewModel, Models, Info.plist and project hashes match this turn's
+  baseline. Build remains **65**, marketing version **1.0**. The pre-existing
+  ChatDetailView staged blob `a672583b807b9b5f8a9fcba229e5e5c4113610b0` is preserved.
+- Production bounded patch reverse check passed without applying it; whitespace
+  checks passed. Final ChatDetailView SHA256:
+  `9da0add29e02b9fc1476668e28f2fb9d7cc878c8bcd74ce0951ec46c0f2db9fb`.
+
+Artifacts: `/Users/mima1234/Library/Developer/CodexReleases/imim-chatB1.8U0pzb`
+contains scroll/conversation/date regression logs, build-final.log,
+ChatDetailView.before.swift, chat-b1.patch and receipt.md.
+
+### Still unverified / not performed
+
+Xcode currently sees the paired iPhone online, unlike previous A2/A3 checks.
+No installation or private-chat trace was performed: the installed/released
+Build 65 predates B1. Real-device user drag/deceleration, keyboard/media updates,
+visible message offset and hitch behavior require an approved fixture/UI run.
+The code-backed deferred-scroll risk is reduced; this is not proof that every
+prior blank-gap/jump symptom is resolved. No Git commit/push, TestFlight upload,
+build bump, App Store change or server mutation was performed in this turn.
+
+## D1 / B2 implementation — maximum further optimization, 2026-10-09
+
+Only production `ChatDetailView.swift` and `VoiceMessageViews.swift` changed.
+
+- Chat image previews no longer read whole files or instantiate original-size
+  UIImage on MainActor. A serial actor reads the ImageIO source and decodes an
+  orientation-transformed, display-pixel thumbnail, capped at a 4096px edge and
+  approximately four megapixels (ImageIO pixel rounding applies). No persistent
+  plaintext thumbnail cache. Existing 190x140 layout/auth/retry/decryption stay.
+- Task identity covers URL, target pixels and content mode. Cancellation is
+  checked before/after decoding and before publication; disappearance releases
+  the thumbnail. Synchronous ImageIO cannot be interrupted mid-call: cancellation
+  discards its result afterward. Source guards are not runtime reuse testing.
+- Chat UI owns a filtered recording observer wrapping the SAME audio manager.
+  Only start/stop/errors notify the screen; meter/cancel state stays in the small
+  recording overlay. Message rows no longer observe the entire recorder. The
+  voice child projects matching messageId/isPlaying/progress and deduplicates.
+  VoiceRecorderManager and its audio session/playback/recording timers are untouched.
+- Wave phase derives from the existing TimelineView date, not a retained
+  repeatForever state animation. The timeline pauses for stop and Reduce Motion;
+  progress/bar dimensions/colors/actions remain. No visibility virtualization
+  or renderer replacement is claimed.
+
+### Verified on final source
+
+- `run-chat-image-decode-regression.sh`: **46 checks**; actual production actor
+  extracted and compiled under Swift 6 complete strict concurrency. Synthetic
+  4000x3000 JPEG becomes 570x427, **976,976 raster bytes (~0.93 MiB)**; full-size
+  4-byte RGBA reference is 48,000,000 bytes (~45.8 MiB). This is decoded thumbnail
+  size, not measured legacy UIImage allocation, peak process RSS or App FPS.
+  JPEG/file/data parity, eight orientation dimension cases, PNG alpha, small
+  image/no-upscale, fit/fill, extreme dimensions, invalid input, precancellation
+  and off-UI-thread assertions pass. Owner data/network/cache are not accessed.
+- `run-chat-voice-observation-regression.sh`: **28 checks**, actual production
+  projection/clock source compiled under Swift 6 complete strict concurrency.
+  A declaration-matched publisher fixture models the unchanged audio manager,
+  not AVAudioPlayer. **500 playback ticks: chat 0, inactive voice 0, active voice
+  500 updates**; broad original publisher emits 500. **500 recording ticks / 1500
+  field writes: chat 0 updates**. Start/stop/errors, switch/reset/joining state,
+  duplicate suppression, weak subscription lifetime and motion/clock cases pass.
+  View source assertions check recording child, playback child and unchanged
+  playback action wiring. This is not a SwiftUI render or audible-device test.
+- Existing B1 scroll **151**, A1 conversation/localization **37**, A2 date **5,832**
+  checks passed again. Total counted behavioral checks: **6,094**.
+- D1 alone, subsequent voice refactor and final full unsigned iOS Release builds
+  all **BUILD SUCCEEDED**. Final source build: `build-final.log`; existing AppIntents
+  extraction warning remains, no new source diagnostic observed.
+- VoiceRecorderManager, ChatDetailViewModel, Models, Info.plist and project hashes
+  match the before-change snapshot. Pre-existing index blobs for ChatDetailView
+  (`a672583b807b9b5f8a9fcba229e5e5c4113610b0`) and VoiceMessageViews
+  (`536655e28ea60a8b0e8aafc48c1917d367e74e50`) are unchanged. Build **1.0 (65)**.
+- Bounded `media-voice.patch` reverse check passed without applying rollback;
+  scoped whitespace checks passed. Final hashes:
+  ChatDetailView `fa30735a1e62d6e79cea1b2a832949ab41aec0860b0a79e985b3f748839a3763`;
+  VoiceMessageViews `879a53baa9efac3759f2ffbb9f010ef21364325f99143d03a4fc1bf86dadb519`.
+
+Artifacts: `/Users/mima1234/Library/Developer/CodexReleases/imim-mediaD1.WxBTCU`
+contains before-source snapshots, image/voice/scroll/conversation/date regression
+logs, staged build logs, final build log, bounded patch and receipt.
+
+### Remaining runtime work
+
+No install/archive/TestFlight upload, Git commit/push, review or server mutation.
+Released/installed Build 65 predates these changes (and B1). No owner private
+conversations were opened/profiled. Device validation still needs approved long
+mixed-message fixtures: image scroll/reappearance/URL swap while decoding,
+start/cancel/send recording, switching/finishing voice playback, keyboard/input,
+Reduce Motion, memory/IO/hitch traces. Historical prepend pixel-offset anchoring
+and long-chat virtualization are still separate work; this is not a claim of
+Telegram-equivalent or maximized whole-App performance.
