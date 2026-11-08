@@ -22,6 +22,7 @@ struct VideoCallSession: Identifiable, Equatable {
     let peerAvatar: String?
     let callType: VideoCallType
     let isIncoming: Bool
+    let chatID: String?
     var status: CallStatus
 
     enum CallStatus: String, Equatable {
@@ -42,7 +43,8 @@ struct VideoCallSession: Identifiable, Equatable {
         peerAvatar: String? = nil,
         callType: VideoCallType,
         isIncoming: Bool,
-        status: CallStatus
+        status: CallStatus,
+        chatID: String? = nil
     ) {
         self.id = id
         self.callId = callId ?? id
@@ -53,6 +55,7 @@ struct VideoCallSession: Identifiable, Equatable {
         self.callType = callType
         self.isIncoming = isIncoming
         self.status = status
+        self.chatID = chatID
     }
 }
 
@@ -66,13 +69,33 @@ final class VideoCallViewModel: ObservableObject {
     @Published private(set) var manager = TRTCManager.shared
 
     private var timer: Timer?
+    private let elapsedTime: () -> TimeInterval
+    private var connectedTime: TimeInterval?
     private var didSendInvite = false
     private var didStartRoomJoin = false
+    private var didReceiveRemoteAnswer = false
+    private var didSeeRemoteParticipant = false
+    private let waitingFeedback: CallWaitingFeedback
+    private let history: CallHistoryStore
+    private var historyToken: CallHistoryStore.Token?
     private var observers: [NSObjectProtocol] = []
     private var cancellables = Set<AnyCancellable>()
 
-    init(session: VideoCallSession) {
+    init(session: VideoCallSession, waitingFeedback: CallWaitingFeedback? = nil, history: CallHistoryStore? = nil,
+         elapsedTime: (() -> TimeInterval)? = nil) {
         self.session = session
+        self.waitingFeedback = waitingFeedback ?? CallWaitingFeedback()
+        self.history = history ?? CallHistoryStore.shared
+        if let elapsedTime {
+            self.elapsedTime = elapsedTime
+        } else {
+            // ContinuousClock includes suspended time and ignores wall-clock changes.
+            let origin = ContinuousClock.now
+            self.elapsedTime = {
+                let elapsed = origin.duration(to: .now).components
+                return Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1_000_000_000_000_000_000
+            }
+        }
         bindTRTCState()
         bindSignalingObservers()
     }
@@ -88,6 +111,9 @@ final class VideoCallViewModel: ObservableObject {
         }
         if let errorMessage {
             return errorMessage
+        }
+        if !session.isIncoming, didSendInvite, !didReceiveRemoteAnswer, !isTerminal {
+            return "等待对方接听"
         }
         return manager.connectionState.title
     }
@@ -105,8 +131,13 @@ final class VideoCallViewModel: ObservableObject {
 
     func startIfNeeded() {
         guard session.status == .connecting || session.status == .ringing else { return }
+        if historyToken == nil {
+            historyToken = history.begin(callID: session.callId, peerID: session.peerId,
+                mediaKind: session.callType.rawValue, isIncoming: session.isIncoming, chatID: session.chatID)
+        }
         if !session.isIncoming, !didSendInvite {
             didSendInvite = true
+            waitingFeedback.startOutgoing(id: session.id)
             SocketManager.shared.sendCallInvite(
                 to: session.peerId,
                 roomId: session.roomId,
@@ -123,12 +154,15 @@ final class VideoCallViewModel: ObservableObject {
     }
 
     func acceptIncomingCall() {
+        waitingFeedback.stop(id: session.id)
         session.status = .connecting
         SocketManager.shared.sendCallAccept(to: session.peerId)
         Task { await joinRoom() }
     }
 
     func rejectIncomingCall() {
+        history.finish(historyToken, reason: .declined)
+        waitingFeedback.stop(id: session.id)
         session.status = .rejected
         if session.isIncoming, let uuid = UUID(uuidString: session.id) {
             SocketManager.shared.sendCallReject(to: session.peerId, callId: session.callId)
@@ -140,6 +174,9 @@ final class VideoCallViewModel: ObservableObject {
     }
 
     func endCall() {
+        refreshDuration()
+        history.finish(historyToken, reason: .endedLocally)
+        waitingFeedback.stop(id: session.id)
         if session.isIncoming, let uuid = UUID(uuidString: session.id) {
             CallManager.shared.end(uuid: uuid, reason: .remoteEnded)
         } else {
@@ -162,12 +199,19 @@ final class VideoCallViewModel: ObservableObject {
         do {
             errorMessage = nil
             let credentials = try await APIClient.shared.fetchTRTCUserSig()
+            guard !Task.isCancelled, !isTerminal else { return }
             await manager.enterRoom(roomId: session.roomId, credentials: credentials, callType: session.callType)
+            guard !Task.isCancelled, !isTerminal else { return }
             if case .failed(let message) = manager.connectionState {
+                history.finish(historyToken, reason: .failed)
+                waitingFeedback.stop(id: session.id)
                 errorMessage = message
                 session.status = .failed
             }
         } catch {
+            guard !isTerminal else { return }
+            history.finish(historyToken, reason: .failed)
+            waitingFeedback.stop(id: session.id)
             errorMessage = error.localizedDescription
             session.status = .failed
         }
@@ -175,6 +219,7 @@ final class VideoCallViewModel: ObservableObject {
 
     private func bindTRTCState() {
         manager.$connectionState
+            .dropFirst() // Do not replay the previous call's shared SDK state.
             .removeDuplicates()
             .sink { [weak self] state in
                 Task { @MainActor in
@@ -182,18 +227,49 @@ final class VideoCallViewModel: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        manager.$remoteParticipants
+            .dropFirst()
+            .map { $0.map(\.id) }
+            .removeDuplicates()
+            .sink { [weak self] ids in
+                Task { @MainActor [weak self] in
+                    guard let self, self.didStartRoomJoin, !self.isTerminal else { return }
+                    if ids.contains(self.session.peerId) {
+                        self.didSeeRemoteParticipant = true
+                        self.markRemoteAnswered()
+                    } else if self.didSeeRemoteParticipant {
+                        // TRTC confirms a previously joined peer left. End even
+                        // if their WebSocket call_end was lost; an initially
+                        // empty room must never cancel an unanswered call.
+                        self.finishRemoteCall()
+                    }
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func handleTRTCState(_ state: TRTCConnectionState) {
-        guard session.status != .ended, session.status != .rejected else { return }
+        guard didStartRoomJoin, !isTerminal else { return }
         switch state {
         case .connected:
+            // Our own TRTC room entry is not the other person's answer.
+            if !session.isIncoming, !didReceiveRemoteAnswer {
+                waitingFeedback.startOutgoing(id: session.id)
+                session.status = .ringing
+                return
+            }
             errorMessage = nil
             if session.status != .connected {
+                history.connected(historyToken)
                 session.status = .connected
                 startTimer()
             }
         case .failed(let message):
+            refreshDuration()
+            history.finish(historyToken, reason: .failed)
+            waitingFeedback.stop(id: session.id)
+            timer?.invalidate()
             errorMessage = message
             session.status = .failed
         default:
@@ -201,14 +277,53 @@ final class VideoCallViewModel: ObservableObject {
         }
     }
 
+    private var isTerminal: Bool {
+        session.status == .ended || session.status == .rejected || session.status == .failed
+    }
+
+    private func markRemoteAnswered() {
+        didReceiveRemoteAnswer = true
+        waitingFeedback.stop(id: session.id)
+        if didStartRoomJoin, manager.connectionState == .connected {
+            handleTRTCState(.connected)
+        } else {
+            session.status = .connecting
+        }
+    }
+
+    private func finishRemoteCall() {
+        guard !isTerminal else { return }
+        refreshDuration()
+        history.finish(historyToken, reason: .endedRemotely)
+        waitingFeedback.stop(id: session.id)
+        session.status = .ended
+        timer?.invalidate()
+        if session.isIncoming, let uuid = UUID(uuidString: session.id) {
+            CallManager.shared.end(uuid: uuid, reason: .remoteEnded, notifyRemote: false)
+        }
+        manager.exitRoom()
+        #if DEBUG
+        print("[CallAudio] event=remote_call_finished")
+        #endif
+    }
+
     private func startTimer() {
         timer?.invalidate()
-        duration = 0
+        if connectedTime == nil { connectedTime = elapsedTime() }
+        refreshDuration()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.duration += 1
+                self?.refreshDuration()
             }
         }
+        timer?.tolerance = 0.1
+    }
+
+    func refreshDuration() {
+        guard !isTerminal, let connectedTime else { return }
+        let elapsed = elapsedTime() - connectedTime
+        guard elapsed.isFinite else { return }
+        duration = max(duration, max(0, elapsed))
     }
 
     private func bindSignalingObservers() {
@@ -216,8 +331,8 @@ final class VideoCallViewModel: ObservableObject {
         observers.append(center.addObserver(forName: .cqimCallAccepted, object: nil, queue: .main) { [weak self] notification in
             guard let self else { return }
             Task { @MainActor in
-                guard self.matchesCurrentCall(notification) else { return }
-                self.session.status = .connecting
+                guard !self.isTerminal, self.matchesCurrentCall(notification) else { return }
+                self.markRemoteAnswered()
                 await self.joinRoom()
             }
         })
@@ -225,7 +340,9 @@ final class VideoCallViewModel: ObservableObject {
         observers.append(center.addObserver(forName: .cqimCallRejected, object: nil, queue: .main) { [weak self] notification in
             guard let self else { return }
             Task { @MainActor in
-                guard self.matchesCurrentCall(notification) else { return }
+                guard !self.isTerminal, self.matchesCurrentCall(notification) else { return }
+                self.history.finish(self.historyToken, reason: .declined)
+                self.waitingFeedback.stop(id: self.session.id)
                 self.session.status = .rejected
                 self.errorMessage = "对方已拒绝"
                 self.timer?.invalidate()
@@ -236,32 +353,35 @@ final class VideoCallViewModel: ObservableObject {
         observers.append(center.addObserver(forName: .cqimCallEnded, object: nil, queue: .main) { [weak self] notification in
             guard let self else { return }
             Task { @MainActor in
-                guard self.matchesCurrentCall(notification) else { return }
-                self.session.status = .ended
-                self.timer?.invalidate()
-                self.manager.exitRoom()
+                guard !self.isTerminal, self.matchesCurrentCall(notification) else { return }
+                self.finishRemoteCall()
             }
         })
     }
 
     private func matchesCurrentCall(_ notification: Notification) -> Bool {
-        let info = notification.userInfo ?? [:]
+        session.matchesSignalingEvent(notification.userInfo)
+    }
+}
+
+extension VideoCallSession {
+    func matchesSignalingEvent(_ userInfo: [AnyHashable: Any]?) -> Bool {
+        let info = userInfo ?? [:]
         let eventCallId = (info["callId"] as? String) ?? (info["uuid"] as? String)
-        if let eventCallId, !eventCallId.isEmpty,
-           eventCallId == session.callId || eventCallId == session.id {
-            return true
+        if let eventCallId, !eventCallId.isEmpty {
+            return eventCallId == callId || eventCallId == id
         }
 
         let eventPeerId = (info["from"] as? String)
             ?? (info["fromUserId"] as? String)
             ?? (info["caller_id"] as? String)
             ?? (info["peerId"] as? String)
-        return eventPeerId == session.peerId
+        return eventPeerId == peerId
     }
 }
 
 extension VideoCallSession {
-    static func outgoing(peerId: String, peerName: String, peerAvatar: String?, callType: VideoCallType) -> VideoCallSession {
+    static func outgoing(peerId: String, peerName: String, peerAvatar: String?, callType: VideoCallType, chatID: String? = nil) -> VideoCallSession {
         let currentUserId = UserDefaults.standard.string(forKey: "current_user_id") ?? "ios"
         let roomId = "room-\([currentUserId, peerId].sorted().joined(separator: "-"))-\(Int(Date().timeIntervalSince1970 * 1000))"
         return VideoCallSession(
@@ -271,7 +391,8 @@ extension VideoCallSession {
             peerAvatar: peerAvatar,
             callType: callType,
             isIncoming: false,
-            status: .connecting
+            status: .connecting,
+            chatID: chatID
         )
     }
 

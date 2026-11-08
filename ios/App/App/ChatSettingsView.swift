@@ -144,62 +144,46 @@ struct ChatSettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 18) {
+            VStack(spacing: 20) {
                 profileHeader
                 settingsCard {
                     NavigationLink { ChatMessageSearchView(chat: chat) } label: {
                         SettingsNavigationRow(title: "查找聊天内容", icon: "magnifyingglass")
                     }
+                    .buttonStyle(.plain)
                 }
-                settingsCard {
-                    Toggle("消息免打扰", isOn: mutedBinding)
-                    Divider()
-                    Toggle("置顶聊天", isOn: chatBooleanBinding(\.isPinned))
-                    Divider()
-                    Toggle("聊天密码", isOn: passwordBinding)
-                    Divider()
-                    Toggle("消息回执", isOn: $isReadReceiptEnabled)
-                        .onChange(of: isReadReceiptEnabled) { _, value in
-                            ConversationPreferences.setReadReceiptsEnabled(value, for: chat.chatId)
-                        }
-                    Text("开启后，对方可看到你已阅读其消息。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+                preferencesSection
                 settingsCard {
                     NavigationLink {
                         ConversationBackgroundPicker(chatId: chat.chatId, onBackgroundChanged: onBackgroundChanged)
                     } label: {
                         SettingsNavigationRow(title: "设置当前聊天背景", icon: "paintpalette")
                     }
-                    Divider()
+                    .buttonStyle(.plain)
+                    settingsDivider
                     Button { openNotificationSettings() } label: {
                         SettingsNavigationRow(title: "消息通知设置", icon: "bell")
                     }
                     .buttonStyle(.plain)
-                    Divider()
+                    settingsDivider
                     Button { isShowingReportSheet = true } label: {
                         SettingsNavigationRow(title: "投诉", icon: "exclamationmark.bubble")
                     }
                     .buttonStyle(.plain)
                 }
-                Button(role: .destructive) { isShowingClearConfirmation = true } label: {
-                    Text("清空聊天记录")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 17)
-                }
-                .background(DoveTheme.cardSurface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                Text("仅清理这台设备上的记录，不会撤回对方消息。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, -8)
+                clearHistorySection
             }
-            .padding(16)
+            .frame(maxWidth: 600)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 32)
         }
-        .background(DoveTheme.mist.ignoresSafeArea())
+        .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         .navigationTitle("聊天详情")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .tint(DoveTheme.accent)
         .sheet(isPresented: $isShowingPasswordSheet) {
             ConversationPasscodeSheet(chatName: chat.name) { passcode in
                 ConversationPreferences.save(passcode: passcode, for: chat.chatId)
@@ -218,15 +202,101 @@ struct ChatSettingsView: View {
     }
 
     private var profileHeader: some View {
-        VStack(spacing: 10) {
-            DoveAvatar(name: chat.name, url: chat.avatar, size: 76, isGroup: chat.type == "group")
-            Text(chat.name).font(.title3.weight(.semibold)).foregroundStyle(DoveTheme.ink)
-            Text(chat.type == "group" ? "群聊" : "端到端加密私聊")
-                .font(.footnote).foregroundStyle(.secondary)
+        HStack(spacing: 16) {
+            DoveAvatar(name: chat.name, url: chat.avatar, userId: chat.avatarCacheIdentity, size: 68, isGroup: chat.type == "group")
+            VStack(alignment: .leading, spacing: 8) {
+                Text(chat.name)
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(DoveTheme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 5) {
+                    Image(systemName: AIConversation.matches(chat.chatId) ? "sparkles" : chat.type == "group" ? "person.2" : "lock.shield")
+                        .accessibilityHidden(true)
+                    AppLocalizedText(AIConversation.matches(chat.chatId) ? "AI 对话由 DeepSeek 处理" : chat.type == "group" ? "群聊" : "端到端加密私聊")
+                }
+                .font(.caption)
+                .foregroundStyle(DoveTheme.secondaryText)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(DoveTheme.cardSurface, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var preferencesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            settingsCard {
+                settingsToggle("消息免打扰", icon: "bell.slash", isOn: mutedBinding)
+                if !chat.isBuiltinSystemConversation {
+                    settingsDivider
+                    settingsToggle("置顶聊天", icon: "pin", isOn: chatBooleanBinding(\.isPinned))
+                }
+                settingsDivider
+                settingsToggle("聊天密码", icon: "lock", isOn: passwordBinding)
+                settingsDivider
+                settingsToggle("消息回执", icon: "checkmark.bubble", isOn: $isReadReceiptEnabled)
+                    .onChange(of: isReadReceiptEnabled) { _, value in
+                        ConversationPreferences.setReadReceiptsEnabled(value, for: chat.chatId)
+                    }
+            }
+            Text("开启后，对方可看到你已阅读其消息。")
+                .font(.caption)
+                .foregroundStyle(DoveTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 12)
+        }
+    }
+
+    private func settingsToggle(_ title: String, icon: String, isOn: Binding<Bool>) -> some View {
+        Toggle(isOn: isOn) {
+            HStack(spacing: 12) {
+                ChatSettingsRowIcon(icon: icon)
+                AppLocalizedText(title)
+                    .foregroundStyle(DoveTheme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .font(.body)
+        .toggleStyle(.switch)
+        .tint(DoveTheme.accent)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(minHeight: 60)
+    }
+
+    private var settingsDivider: some View {
+        Divider().padding(.leading, 60)
+    }
+
+    private var clearHistorySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button(role: .destructive) { isShowingClearConfirmation = true } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "trash")
+                        .font(.body)
+                        .frame(width: 32, height: 32)
+                        .accessibilityHidden(true)
+                    Text("清空聊天记录")
+                        .font(.body.weight(.medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.red)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, minHeight: 60, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background(DoveTheme.cardSurface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            Text("仅清理这台设备上的记录，不会撤回对方消息。")
+                .font(.caption)
+                .foregroundStyle(DoveTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 12)
+        }
     }
 
     private var passwordBinding: Binding<Bool> {
@@ -265,9 +335,9 @@ struct ChatSettingsView: View {
     }
 
     private func settingsCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 14, content: content)
-            .padding(16)
+        VStack(alignment: .leading, spacing: 0, content: content)
             .background(DoveTheme.cardSurface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func clearLocalHistory() {
@@ -293,16 +363,79 @@ private struct SettingsNavigationRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: icon)
-                .foregroundStyle(DoveTheme.green)
-                .frame(width: 22)
-            Text(title).foregroundStyle(DoveTheme.ink)
-            Spacer()
-            Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+            ChatSettingsRowIcon(icon: icon)
+            AppLocalizedText(title)
+                .font(.body)
+                .foregroundStyle(DoveTheme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, minHeight: 60)
         .contentShape(Rectangle())
     }
 }
+
+private struct ChatSettingsRowIcon: View {
+    let icon: String
+
+    var body: some View {
+        Image(systemName: icon)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(DoveTheme.accent)
+            .frame(width: 32, height: 32)
+            .background(DoveTheme.accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .accessibilityHidden(true)
+    }
+}
+
+#if DEBUG
+@MainActor
+private struct ChatSettingsDesignPreview: View {
+    private let container: ModelContainer
+    private let chat: Chat
+
+    init(name: String, isGroup: Bool = false) {
+        let schema = Schema([User.self, Chat.self, Message.self])
+        container = try! ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema, isStoredInMemoryOnly: true))
+        chat = Chat(chatId: "chat-settings-design-fixture", name: name, type: isGroup ? "group" : "private")
+        container.mainContext.insert(chat)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ChatSettingsView(chat: chat, onBackgroundChanged: {})
+        }
+        .modelContainer(container)
+        // Preview controls must never write to real preferences or Keychain.
+        .allowsHitTesting(false)
+    }
+}
+
+#Preview("Chat details · Light") {
+    ChatSettingsDesignPreview(name: "林小满")
+        .environment(\.locale, Locale(identifier: "zh-Hans"))
+        .preferredColorScheme(.light)
+}
+
+#Preview("Chat details · Dark group") {
+    ChatSettingsDesignPreview(name: "设计小组", isGroup: true)
+        .environment(\.locale, Locale(identifier: "zh-Hans"))
+        .preferredColorScheme(.dark)
+}
+
+#Preview("Chat details · English accessibility") {
+    ChatSettingsDesignPreview(name: "Alexandria · Design and Engineering")
+        .environment(\.locale, Locale(identifier: "en"))
+        .environment(\.dynamicTypeSize, .accessibility2)
+        .preferredColorScheme(.light)
+}
+#endif
 
 private struct ConversationBackgroundPicker: View {
     @Environment(\.dismiss) private var dismiss
@@ -327,7 +460,7 @@ private struct ConversationBackgroundPicker: View {
                     ConversationBackground(style: style)
                         .frame(width: 76, height: 48)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    Text(style.title).foregroundStyle(DoveTheme.ink)
+                    AppLocalizedText(style.title).foregroundStyle(DoveTheme.ink)
                     Spacer()
                     if selectedStyle == style { Image(systemName: "checkmark.circle.fill").foregroundStyle(DoveTheme.green) }
                 }
@@ -337,29 +470,60 @@ private struct ConversationBackgroundPicker: View {
     }
 }
 
+// MARK: - Chat search projection
+
+/// Ephemeral presentation of existing messages, not a second persistent cache.
+/// Local call metadata must never be searched/rendered as serialized JSON.
+enum ChatMessageSearchProjection {
+    struct Row: Identifiable {
+        let message: Message
+        let text: String
+        var id: String { message.messageId }
+    }
+
+    static func rows(messages: [Message], query: String, language: AppLanguage) -> [Row] {
+        let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !keyword.isEmpty else { return [] }
+        return messages.compactMap { message in
+            guard let text = displayText(message, language: language),
+                  text.localizedCaseInsensitiveContains(keyword) else { return nil }
+            return Row(message: message, text: text)
+        }.sorted { left, right in
+            if left.message.createdAt != right.message.createdAt { return left.message.createdAt > right.message.createdAt }
+            return left.id < right.id
+        }
+    }
+
+    static func displayText(_ message: Message, language: AppLanguage) -> String? {
+        guard message.type == "call" else { return message.content }
+        guard let entry = CallHistoryEntry.decode(message) else { return nil }
+        let title = AppLocalization.string(entry.titleKey, language: language)
+        return entry.connectedAt == nil ? title : title + " · " + entry.formattedDuration
+    }
+}
+
+// MARK: - End chat search projection
+
 private struct ChatMessageSearchView: View {
+    @Environment(\.locale) private var locale
     let chat: Chat
     @State private var query = ""
 
-    private var results: [Message] {
-        let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !keyword.isEmpty else { return [] }
-        return chat.messages
-            .filter { $0.content.localizedCaseInsensitiveContains(keyword) }
-            .sorted { $0.createdAt > $1.createdAt }
-    }
-
     var body: some View {
-        List {
-            if query.isEmpty {
+        let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let language: AppLanguage = locale.identifier.hasPrefix("zh") ? .simplifiedChinese : .english
+        let rows = ChatMessageSearchProjection.rows(messages: chat.messages, query: keyword, language: language)
+        return List {
+            if keyword.isEmpty {
                 ContentUnavailableView("搜索聊天记录", systemImage: "magnifyingglass", description: Text("输入关键词后查找本机消息。"))
-            } else if results.isEmpty {
+            } else if rows.isEmpty {
                 ContentUnavailableView.search(text: query)
             } else {
-                ForEach(results, id: \.messageId) { message in
+                ForEach(rows) { row in
+                    let message = row.message
                     VStack(alignment: .leading, spacing: 5) {
-                        Text(message.isOutgoing ? "我" : chat.name).font(.caption).foregroundStyle(.secondary)
-                        Text(message.content).foregroundStyle(DoveTheme.ink).lineLimit(2)
+                        Text(message.isOutgoing ? AppLocalization.text("我") : chat.name).font(.caption).foregroundStyle(.secondary)
+                        Text(verbatim: row.text).foregroundStyle(DoveTheme.ink).lineLimit(2)
                         Text(message.createdAt.formatted(date: .abbreviated, time: .shortened)).font(.caption2).foregroundStyle(.tertiary)
                     }
                     .padding(.vertical, 3)
@@ -389,7 +553,7 @@ private struct ConversationPasscodeSheet: View {
                     SecureField("再次输入密码", text: $confirmation)
                         .keyboardType(.numberPad)
                 }
-                if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                if let errorMessage { AppLocalizedText(errorMessage).foregroundStyle(.red) }
             }
             .navigationTitle("聊天密码")
             .toolbar {
@@ -429,7 +593,7 @@ struct ConversationUnlockOverlay: View {
                 .multilineTextAlignment(.center)
                 .padding(12)
                 .background(.background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            if let errorMessage { Text(errorMessage).font(.footnote).foregroundStyle(.red) }
+            if let errorMessage { AppLocalizedText(errorMessage).font(.footnote).foregroundStyle(.red) }
             Button("解锁", action: unlock)
                 .buttonStyle(.borderedProminent)
                 .tint(DoveTheme.green)

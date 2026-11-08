@@ -6,19 +6,7 @@ struct E2EEMediaEncryptionResult: Hashable {
     let encryptedData: Data
     let envelopeString: String
     let encryptedFileName: String
-}
-
-private struct E2EEMediaEnvelopeMetadata: Codable, Hashable {
-    let version: Int
-    let originalType: String
-    let fileName: String
-    let mimeType: String
-    let byteSize: Int
-    let mediaKey: String
-    let mediaIV: String
-    let mediaTag: String
-    let duration: Double?
-    let waveform: [Double]?
+    let metadata: EncryptedMediaMetadata
 }
 
 struct SignalEncryptedPayload: Codable, Hashable {
@@ -37,6 +25,9 @@ struct SignalEnvelope: Codable, Hashable {
     let senderEphemeralKey: String?
     let recipientSignedPreKeyId: Int?
     let recipientOneTimePreKeyId: Int?
+    // The deployed Web client used these names before v2. Keep both on send.
+    var usedSignedPreKeyId: Int? = nil
+    var usedOneTimePreKeyId: Int? = nil
     let senderRatchetKey: String
     let previousCounter: Int
     let counter: Int
@@ -47,6 +38,7 @@ struct SignalEnvelope: Codable, Hashable {
 struct E2EEPreKeyBundle: Codable, Hashable {
     let registrationId: Int
     let identityKey: String
+    var signingPublicKey: String? = nil
     let signedPreKeyId: Int
     let signedPreKey: String
     let signedPreKeySignature: String
@@ -57,6 +49,7 @@ struct E2EEPreKeyBundle: Codable, Hashable {
 struct E2EELocalPreKeyBundle: Codable, Hashable {
     let registrationId: Int
     let identityKey: String
+    var signingPublicKey: String? = nil
     let signedPreKeyId: Int
     let signedPreKey: String
     let signedPreKeySignature: String
@@ -66,6 +59,94 @@ struct E2EEDiagnostics: Equatable {
     let registrationId: Int
     let identityFingerprint: String
     let availablePreKeyCount: Int
+}
+
+// Public metadata only. Never return registration/session objects to the UI.
+struct E2EEPeerSecurityInfo: Equatable, Sendable {
+    let ownerID: String
+    let peerID: String
+    let localFingerprint: String
+    let remoteFingerprint: String
+    let safetyNumber: String
+    let binding: String
+    let sendCounter: Int
+    let receiveCounter: Int
+    let verifiedAt: Date?
+    let identityChanged: Bool
+
+    var qrPayload: String {
+        let payload = IMIMSafetyCode.Payload(type: "imim-safety-number", v: 1,
+            safetyNumber: safetyNumber.replacingOccurrences(of: " ", with: ""),
+            localKey: localFingerprint, remoteKey: remoteFingerprint, peerId: peerID, ownerId: ownerID)
+        return (try? String(decoding: JSONEncoder().encode(payload), as: UTF8.self)) ?? ""
+    }
+
+    func matchesQR(_ text: String) -> Bool {
+        guard text.utf8.count <= 8_192, let data = text.data(using: .utf8),
+              let code = try? JSONDecoder().decode(IMIMSafetyCode.Payload.self, from: data),
+              code.type == "imim-safety-number", code.v == 1,
+              code.peerId == ownerID, code.ownerId == nil || code.ownerId == peerID else { return false }
+        // A peer's displayed QR has the opposite local/remote orientation.
+        return code.localKey == remoteFingerprint && code.remoteKey == localFingerprint &&
+            code.safetyNumber == safetyNumber.replacingOccurrences(of: " ", with: "")
+    }
+}
+
+enum E2EESecurityInfoError: Error, Equatable {
+    case accountChanged, noSession, identityChanged, unavailable
+}
+
+/// Existing IMIM Web v1 compatibility, NOT Signal's standard 60-digit fingerprint.
+/// Independent implementation of the deployed byte-based 520-digit encoding.
+enum IMIMSafetyCode {
+    struct Payload: Codable {
+        let type: String
+        let v: Int
+        let safetyNumber: String
+        let localKey: String
+        let remoteKey: String
+        let peerId: String
+        let ownerId: String?
+    }
+
+    static func fingerprint(_ bytes: Data) -> String {
+        SHA256.hash(data: bytes).prefix(8).map { String(format: "%02X", $0) }.joined(separator: ":")
+    }
+
+    static func number(local: Data, remote: Data) -> String {
+        let ordered = local.base64EncodedString() < remote.base64EncodedString() ? [local, remote] : [remote, local]
+        var current = ordered[0] + ordered[1]
+        var digits = ""
+        var round: UInt8 = 0
+        while digits.count < 520 {
+            current.append(round)
+            current = Data(SHA256.hash(data: current))
+            for byte in current where digits.count < 520 {
+                digits += String((Int(byte) / 10) % 10)
+                if digits.count < 520 { digits += String(Int(byte) % 10) }
+            }
+            round &+= 1
+        }
+        let chars = Array(digits)
+        return stride(from: 0, to: 520, by: 10).map { String(chars[$0..<($0 + 10)]) }.joined(separator: " ")
+    }
+
+    static func binding(owner: String, peer: String, local: Data, remote: Data) -> String {
+        // Length-delimited fields avoid identifier concatenation collisions.
+        var bytes = Data("imim-peer-verification-v1".utf8)
+        for field in [Data(owner.utf8), Data(peer.utf8), local, remote] {
+            var length = UInt64(field.count).bigEndian
+            withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+            bytes.append(field)
+        }
+        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private struct E2EEPeerVerification: Codable {
+    let binding: String
+    let verifiedAt: Date?
+    let identityChanged: Bool
 }
 
 struct E2EEPreKeyUpload: Codable, Hashable {
@@ -79,6 +160,7 @@ enum E2EEError: LocalizedError {
     case mediaEncryptionUnavailable
     case invalidEnvelope
     case invalidRemoteBundle
+    case missingOneTimePreKey
     case keyAgreementFailed
     case unsupportedProtocol
 
@@ -94,6 +176,8 @@ enum E2EEError: LocalizedError {
             return "加密信封格式无效，已阻止发送。"
         case .invalidRemoteBundle:
             return "对方尚未注册 E2EE 密钥，暂时无法发送加密消息。"
+        case .missingOneTimePreKey:
+            return "一次性预密钥不可用，已保留当前安全会话，请让对方重新发送。"
         case .keyAgreementFailed:
             return "端到端加密密钥协商失败，已阻止发送。"
         case .unsupportedProtocol:
@@ -109,8 +193,34 @@ final class E2EEManager {
     private let decoder = JSONDecoder()
     private let keychain = E2EEKeychainStore()
     private let stateQueue = DispatchQueue(label: "chat.imim.e2ee.state")
+    private let operations = E2EEOperationQueue()
+    private var deletedAccounts = Set<String>()
 
     private init() {}
+
+#if E2EE_REGRESSION_TESTS
+    // The CLI harness compiles the production implementation with a memory-only
+    // store. This code is excluded from all app builds and never reads Keychain.
+    static func regressionInstance() -> E2EEManager { E2EEManager() }
+    func regressionBundle(userId: String) throws -> E2EEPreKeyBundle {
+        let registration = try requireRegistration(userId: userId)
+        let key = try keychain.loadPreKeys(userId: userId).first
+        return E2EEPreKeyBundle(registrationId: registration.registrationId,
+            identityKey: registration.identityKeyPair.pubKey,
+            signingPublicKey: registration.signingKeyPair?.pubKey,
+            signedPreKeyId: registration.signedPreKey.id, signedPreKey: registration.signedPreKey.keyPair.pubKey,
+            signedPreKeySignature: registration.signedPreKey.signature,
+            oneTimePreKeyId: key?.id, oneTimePreKey: key?.keyPair.pubKey)
+    }
+    func regressionState(userId: String, peerId: String) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(keychain.loadSession(userId: userId, peerId: peerId))
+    }
+    func regressionVerification(userId: String, peerId: String) throws -> Data {
+        try JSONEncoder().encode(keychain.loadVerification(userId: userId, peerId: peerId))
+    }
+#endif
 
     func bootstrapForCurrentUser() async {
         do {
@@ -127,21 +237,30 @@ final class E2EEManager {
         guard let userId = UserDefaults.standard.string(forKey: "current_user_id"), !userId.isEmpty else {
             throw E2EEError.missingCurrentUser
         }
-        try await initializeAndRegisterIfNeeded(userId: userId, forceBundleRegistration: forceBundleRegistration)
+        try await operations.perform {
+            try await self.initializeAndRegisterIfNeeded(userId: userId, forceBundleRegistration: forceBundleRegistration)
+        }
     }
 
     /// Discards only the ratchet shared with one peer. The next outgoing
     /// message is a fresh PreKey message; historical ciphertext stays intact.
-    func resetSession(with peerId: String) throws {
+    func resetSession(with peerId: String) async throws {
         guard let userId = UserDefaults.standard.string(forKey: "current_user_id"), !userId.isEmpty else {
             throw E2EEError.missingCurrentUser
         }
-        try stateQueue.sync {
-            try keychain.deleteSession(userId: userId, peerId: peerId)
+        try await operations.perform {
+            try self.keychain.deleteSession(userId: userId, peerId: peerId)
         }
     }
 
     /// Exposes only non-secret metadata for the native security settings screen.
+    func removeAccountKeys(userId: String) async throws {
+        try await operations.perform {
+            self.deletedAccounts.insert(userId)
+            try self.keychain.removeAccountKeys(userId: userId)
+        }
+    }
+
     func diagnosticsForCurrentUser() -> E2EEDiagnostics? {
         guard let userId = UserDefaults.standard.string(forKey: "current_user_id"), !userId.isEmpty else {
             return nil
@@ -171,16 +290,64 @@ final class E2EEManager {
         }
     }
 
-    func encryptText(_ plaintext: String, peerId: String) async throws -> String {
+    /// Read through the same serialized operation queue as encrypt/decrypt.
+    /// Never fetch a bundle, consume PreKeys, initialize keys or advance a ratchet.
+    func peerSecurityInfo(ownerID: String, peerID: String) async throws -> E2EEPeerSecurityInfo {
+        try await operations.perform { try self.peerSecurityInfoLocked(ownerID: ownerID, peerID: peerID) }
+    }
+
+    func setPeerVerified(ownerID: String, peerID: String, expectedBinding: String, verified: Bool) async throws {
+        try await operations.perform {
+            let current = try self.peerSecurityInfoLocked(ownerID: ownerID, peerID: peerID)
+            guard current.binding == expectedBinding else { throw E2EESecurityInfoError.identityChanged }
+            try self.keychain.saveVerification(.init(binding: current.binding,
+                verifiedAt: verified ? Date() : nil, identityChanged: false), userId: ownerID, peerId: peerID)
+        }
+    }
+
+    private func peerSecurityInfoLocked(ownerID: String, peerID: String) throws -> E2EEPeerSecurityInfo {
+        guard !ownerID.isEmpty, !peerID.isEmpty, ownerID != peerID,
+              ownerID == UserDefaults.standard.string(forKey: "current_user_id"),
+              !deletedAccounts.contains(ownerID) else { throw E2EESecurityInfoError.accountChanged }
+        guard let registration = try keychain.loadRegistration(userId: ownerID),
+              let session = try keychain.loadSession(userId: ownerID, peerId: peerID),
+              session.ratchetState.protocolVersion == 2 else { throw E2EESecurityInfoError.noSession }
+        guard session.localIdentityKey == registration.identityKeyPair.pubKey else { throw E2EESecurityInfoError.identityChanged }
+        guard let local = Data(base64Encoded: session.localIdentityKey),
+              let remote = Data(base64Encoded: session.ratchetState.remoteIdentityKey), local != remote,
+              (try? P256.KeyAgreement.PublicKey(derRepresentation: local)) != nil,
+              (try? P256.KeyAgreement.PublicKey(derRepresentation: remote)) != nil else { throw E2EESecurityInfoError.unavailable }
+        let binding = IMIMSafetyCode.binding(owner: ownerID, peer: peerID, local: local, remote: remote)
+        var marker = try keychain.loadVerification(userId: ownerID, peerId: peerID)
+        if let previous = marker, previous.binding != binding {
+            let changed = E2EEPeerVerification(binding: binding, verifiedAt: nil, identityChanged: true)
+            try keychain.saveVerification(changed, userId: ownerID, peerId: peerID)
+            marker = changed
+        }
+        return E2EEPeerSecurityInfo(ownerID: ownerID, peerID: peerID,
+            localFingerprint: IMIMSafetyCode.fingerprint(local), remoteFingerprint: IMIMSafetyCode.fingerprint(remote),
+            safetyNumber: IMIMSafetyCode.number(local: local, remote: remote), binding: binding,
+            sendCounter: session.ratchetState.sendCounter, receiveCounter: session.ratchetState.receiveCounter,
+            verifiedAt: marker?.verifiedAt, identityChanged: marker?.identityChanged ?? false)
+    }
+
+    func encryptText(_ plaintext: String, peerId: String, structuredPayload: Bool = false) async throws -> String {
         guard let userId = UserDefaults.standard.string(forKey: "current_user_id"), !userId.isEmpty else {
             throw E2EEError.missingCurrentUser
         }
 
-        try await initializeAndRegisterIfNeeded(userId: userId)
-        let envelope = try await stateQueue.asyncThrowing {
-            try await self.encryptTextLocked(plaintext, userId: userId, peerId: peerId)
+        let wireText: String
+        if structuredPayload {
+            wireText = plaintext
+        } else {
+            let data = try JSONSerialization.data(withJSONObject: ["content": plaintext, "msgType": "text"])
+            wireText = String(decoding: data, as: UTF8.self)
         }
-        let data = try encoder.encode(envelope)
+        let envelope = try await operations.perform {
+            try await self.initializeAndRegisterIfNeeded(userId: userId)
+            return try await self.encryptTextLocked(wireText, userId: userId, peerId: peerId)
+        }
+        let data = try JSONEncoder().encode(envelope)
         guard let json = String(data: data, encoding: .utf8) else {
             throw E2EEError.invalidEnvelope
         }
@@ -189,7 +356,7 @@ final class E2EEManager {
 
     func validateEnvelopeString(_ envelopeString: String) throws -> String {
         guard let data = envelopeString.data(using: .utf8),
-              let envelope = try? decoder.decode(SignalEnvelope.self, from: data),
+              let envelope = try? JSONDecoder().decode(SignalEnvelope.self, from: data),
               envelope.version == 2,
               (envelope.type == "prekey" || envelope.type == "message"),
               !envelope.senderIdentityKey.isEmpty,
@@ -202,18 +369,30 @@ final class E2EEManager {
         return envelopeString
     }
 
-    func decryptText(_ envelopeString: String, peerId: String) async throws -> String {
+    func decryptText(_ envelopeString: String, peerId: String, persistSession: Bool = true) async throws -> String {
         guard let data = envelopeString.data(using: .utf8) else {
             throw E2EEError.invalidEnvelope
         }
-        let envelope = try decoder.decode(SignalEnvelope.self, from: data)
+        let envelope = try JSONDecoder().decode(SignalEnvelope.self, from: data)
         guard let userId = UserDefaults.standard.string(forKey: "current_user_id"), !userId.isEmpty else {
             throw E2EEError.missingCurrentUser
         }
-        try await initializeAndRegisterIfNeeded(userId: userId)
-        return try await stateQueue.asyncThrowing {
-            try await self.decryptTextLocked(envelope, userId: userId, peerId: peerId)
+        let plaintext = try await operations.perform {
+            // Existing local keys are sufficient for history. Do not make
+            // decryption depend on a successful key-directory network request.
+            if try self.keychain.loadRegistration(userId: userId) == nil {
+                guard persistSession else { throw E2EEError.nativeSignalUnavailable }
+                try await self.initializeAndRegisterIfNeeded(userId: userId)
+            }
+            return try await self.decryptTextLocked(envelope, userId: userId, peerId: peerId, persistSession: persistSession)
         }
+        // Web text messages contain a JSON application payload, not raw text.
+        if let bytes = plaintext.data(using: .utf8),
+           let payload = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+           payload["msgType"] as? String == "text", let content = payload["content"] as? String {
+            return content
+        }
+        return plaintext
     }
 
     func encryptMediaPayload(
@@ -235,7 +414,7 @@ final class E2EEManager {
             nonce: AES.GCM.Nonce(data: nonceData)
         )
         let encryptedData = sealed.ciphertext + sealed.tag
-        let metadata = E2EEMediaEnvelopeMetadata(
+        let metadata = EncryptedMediaMetadata(
             version: 1,
             originalType: originalType,
             fileName: fileName,
@@ -251,15 +430,17 @@ final class E2EEManager {
         guard let metadataString = String(data: metadataData, encoding: .utf8) else {
             throw E2EEError.invalidEnvelope
         }
-        let envelope = try await encryptText(metadataString, peerId: peerId)
+        let envelope = try await encryptText(metadataString, peerId: peerId, structuredPayload: true)
         return E2EEMediaEncryptionResult(
             encryptedData: encryptedData,
             envelopeString: envelope,
-            encryptedFileName: "\(fileName).enc"
+            encryptedFileName: "\(fileName).enc",
+            metadata: metadata
         )
     }
 
     private func initializeAndRegisterIfNeeded(userId: String, forceBundleRegistration: Bool = false) async throws {
+        guard !deletedAccounts.contains(userId) else { throw E2EEError.missingCurrentUser }
         let didCreateRegistration: Bool
         if try keychain.loadRegistration(userId: userId) == nil {
             let identity = P256.KeyAgreement.PrivateKey()
@@ -278,15 +459,40 @@ final class E2EEManager {
             didCreateRegistration = false
         }
 
+        // Legacy builds put the public key itself in the signature field.
+        // Re-sign the SAME signed prekey; never rotate private keys on upgrade.
+        var upgraded = try requireRegistration(userId: userId)
+        let needsSigningMigration = upgraded.signingKeyPair == nil
+        if needsSigningMigration {
+            let signing = P256.Signing.PrivateKey()
+            upgraded.signingKeyPair = E2EEKeyPair(pubKey: signing.publicKey.derRepresentation.base64EncodedString(), privKey: signing.derRepresentation.base64EncodedString())
+            guard let publicData = Data(base64Encoded: upgraded.signedPreKey.keyPair.pubKey) else {
+                throw E2EEError.invalidRemoteBundle
+            }
+            upgraded.signedPreKey = E2EESignedPreKey(id: upgraded.signedPreKey.id, keyPair: upgraded.signedPreKey.keyPair, signature: try signing.signature(for: publicData).rawRepresentation.base64EncodedString())
+            try keychain.saveRegistration(upgraded, userId: userId)
+        }
+
         let registration = try requireRegistration(userId: userId)
         let markerKey = "e2ee_bundle_registration_id_\(userId)"
-        if forceBundleRegistration || didCreateRegistration || UserDefaults.standard.integer(forKey: markerKey) != registration.registrationId {
+        let poolSchemaMarkerKey = "e2ee_prekey_pool_schema_version_\(userId)"
+        let requiresPoolReconciliation = UserDefaults.standard.integer(forKey: poolSchemaMarkerKey) < 2
+        if forceBundleRegistration
+            || needsSigningMigration
+            || didCreateRegistration
+            || UserDefaults.standard.integer(forKey: markerKey) != registration.registrationId
+            || requiresPoolReconciliation {
             try await registerBundle(userId: userId)
             UserDefaults.standard.set(registration.registrationId, forKey: markerKey)
+            // Reconcile once on upgrade. Server tombstones must exclude issued
+            // IDs even when this installation re-uploads their public halves.
+            UserDefaults.standard.set(2, forKey: poolSchemaMarkerKey)
             print("[E2EE] bundle registered force=\(forceBundleRegistration) registration=\(registration.registrationId)")
         }
 
-        let count = (try? await APIClient.shared.fetchE2EEPreKeyCount(userId: userId)) ?? 0
+        // A network/auth failure is not an empty pool. It must not cause new
+        // private keys to be minted for every historical decrypt attempt.
+        guard let count = try? await APIClient.shared.fetchE2EEPreKeyCount(userId: userId) else { return }
         if count < 5 {
             let startId = max(registration.nextPreKeyId, Int(Date().timeIntervalSince1970) % 100_000)
             let newKeys = try generatePreKeys(userId: userId, startId: startId, count: 20)
@@ -305,6 +511,7 @@ final class E2EEManager {
         let bundle = E2EELocalPreKeyBundle(
             registrationId: registration.registrationId,
             identityKey: registration.identityKeyPair.pubKey,
+            signingPublicKey: registration.signingKeyPair?.pubKey,
             signedPreKeyId: registration.signedPreKey.id,
             signedPreKey: registration.signedPreKey.keyPair.pubKey,
             signedPreKeySignature: registration.signedPreKey.signature
@@ -334,18 +541,24 @@ final class E2EEManager {
 
         sessionData.ratchetState.sendChainKey = derived.nextChainKey.base64EncodedString()
         sessionData.ratchetState.sendCounter += 1
-        let isFirstMessage = !sessionData.ratchetState.sentPreKey
+        // Keep the initiation header until an authenticated peer reply proves
+        // that the receiver owns this session. Encrypting (or an HTTP ack)
+        // alone cannot prove receipt of the first envelope.
+        let needsPreKey = !sessionData.ratchetState.sentPreKey ||
+            (sessionData.ephemeralKey != nil && sessionData.ratchetState.receiveChainKey == nil)
         sessionData.ratchetState.sentPreKey = true
         try keychain.saveSession(sessionData, userId: userId, peerId: peerId)
 
         return SignalEnvelope(
             version: 2,
-            type: isFirstMessage ? "prekey" : "message",
+            type: needsPreKey ? "prekey" : "message",
             senderRegistrationId: sessionData.localRegistrationId,
             senderIdentityKey: sessionData.localIdentityKey,
-            senderEphemeralKey: isFirstMessage ? sessionData.ephemeralKey : nil,
-            recipientSignedPreKeyId: isFirstMessage ? sessionData.recipientSignedPreKeyId : nil,
-            recipientOneTimePreKeyId: isFirstMessage ? sessionData.recipientOneTimePreKeyId : nil,
+            senderEphemeralKey: needsPreKey ? sessionData.ephemeralKey : nil,
+            recipientSignedPreKeyId: needsPreKey ? sessionData.recipientSignedPreKeyId : nil,
+            recipientOneTimePreKeyId: needsPreKey ? sessionData.recipientOneTimePreKeyId : nil,
+            usedSignedPreKeyId: needsPreKey ? sessionData.recipientSignedPreKeyId : nil,
+            usedOneTimePreKeyId: needsPreKey ? sessionData.recipientOneTimePreKeyId : nil,
             senderRatchetKey: sessionData.ratchetState.dhSendingKeyPair.pubKey,
             previousCounter: sessionData.ratchetState.previousSendCounter,
             counter: sessionData.ratchetState.sendCounter,
@@ -354,23 +567,47 @@ final class E2EEManager {
         )
     }
 
-    private func decryptTextLocked(_ envelope: SignalEnvelope, userId: String, peerId: String) async throws -> String {
+    private func decryptTextLocked(_ envelope: SignalEnvelope, userId: String, peerId: String, persistSession: Bool = true) async throws -> String {
+        guard envelope.version == nil || envelope.version == 2 else {
+            throw E2EEError.unsupportedProtocol
+        }
+        guard envelope.counter > 0, envelope.previousCounter >= 0 else { throw E2EEError.invalidEnvelope }
+        if let native = envelope.recipientSignedPreKeyId, let web = envelope.usedSignedPreKeyId, native != web { throw E2EEError.invalidEnvelope }
+        if let native = envelope.recipientOneTimePreKeyId, let web = envelope.usedOneTimePreKeyId, native != web { throw E2EEError.invalidEnvelope }
+
         var session = try keychain.loadSession(userId: userId, peerId: peerId)
         var acceptedPreKeySession = false
         if session?.ratchetState.protocolVersion != 2 {
-            try keychain.deleteSession(userId: userId, peerId: peerId)
             session = nil
+        }
+        let cacheKey = "\(envelope.senderRatchetKey):\(envelope.counter)"
+        if var existing = session, let skippedKey = existing.ratchetState.skippedMessageKeys[cacheKey],
+           let key = Data(base64Encoded: skippedKey) {
+            let plaintext = try aesDecrypt(envelope.ciphertext, key: key)
+            existing.ratchetState.skippedMessageKeys.removeValue(forKey: cacheKey)
+            if persistSession { try keychain.saveSession(existing, userId: userId, peerId: peerId) }
+            return String(decoding: plaintext, as: UTF8.self)
+        }
+        if session?.ratchetState.retiredRatchetKeys.contains(envelope.senderRatchetKey) == true {
+            throw E2EEError.invalidEnvelope
         }
 
-        // Every PreKey envelope starts a new X3DH session. A peer can reset
-        // its ratchet without changing its identity or registration; retaining
-        // the old receive chain in that case makes the new first message fail.
-        if envelope.type == "prekey", session != nil {
-            try keychain.deleteSession(userId: userId, peerId: peerId)
-            session = nil
-        }
-        if session == nil, envelope.type == "prekey", envelope.version == 2 {
+        // Build a replacement X3DH session in memory and commit it only after
+        // AES-GCM authentication succeeds. Historical/replayed PreKey messages
+        // must never delete a currently working ratchet before they prove that
+        // this device still owns every referenced private key.
+        if envelope.type == "prekey" && envelope.senderRatchetKey != session?.ratchetState.dhReceivingKey {
+            if let existing = session, existing.ephemeralKey != nil,
+               existing.ratchetState.receiveChainKey == nil,
+               existing.ratchetState.remoteIdentityKey == envelope.senderIdentityKey,
+               existing.ratchetState.remoteRegistrationId == envelope.senderRegistrationId,
+               envelope.senderIdentityKey <= existing.localIdentityKey {
+                // Same deterministic initiator tie-break as the Web client.
+                throw E2EEError.invalidEnvelope
+            }
+            let previous = session?.ratchetState
             session = try acceptPreKeyMessage(envelope, userId: userId, peerId: peerId)
+            session?.ratchetState.retiredRatchetKeys = Array(((previous?.retiredRatchetKeys ?? []) + (previous?.dhReceivingKey.map { [$0] } ?? [])).suffix(128))
             acceptedPreKeySession = true
         }
         guard var session else {
@@ -378,11 +615,16 @@ final class E2EEManager {
         }
 
         if envelope.senderRatchetKey != session.ratchetState.dhReceivingKey {
+            try skipReceiveKeys(&session.ratchetState, until: envelope.previousCounter)
+            if let previous = session.ratchetState.dhReceivingKey {
+                session.ratchetState.retiredRatchetKeys = Array((session.ratchetState.retiredRatchetKeys + [previous]).suffix(128))
+            }
             session = try performDHRatchet(session, newRemoteRatchetKey: envelope.senderRatchetKey)
         }
-
-        let chainSource = session.ratchetState.receiveChainKey ?? session.ratchetState.sendChainKey ?? session.ratchetState.rootKey
-        guard let chainKey = Data(base64Encoded: chainSource) else {
+        guard envelope.counter > session.ratchetState.receiveCounter else { throw E2EEError.invalidEnvelope }
+        try skipReceiveKeys(&session.ratchetState, until: envelope.counter - 1)
+        guard let chainSource = session.ratchetState.receiveChainKey,
+              let chainKey = Data(base64Encoded: chainSource) else {
             throw E2EEError.keyAgreementFailed
         }
         let derived = deriveMessageKeys(chainKey: chainKey)
@@ -390,10 +632,15 @@ final class E2EEManager {
 
         session.ratchetState.receiveChainKey = derived.nextChainKey.base64EncodedString()
         session.ratchetState.receiveCounter += 1
-        if acceptedPreKeySession, let usedPreKeyId = session.usedOneTimePreKeyId {
-            try keychain.removePreKey(id: usedPreKeyId, userId: userId)
+        // A user-requested historical retry may authenticate with a saved
+        // skipped key or old bootstrap material. Reading it must never roll
+        // the live conversation back or consume its only remaining prekey.
+        if persistSession {
+            try keychain.saveSession(session, userId: userId, peerId: peerId)
+            if acceptedPreKeySession, let usedPreKeyId = session.usedOneTimePreKeyId {
+                try keychain.removePreKey(id: usedPreKeyId, userId: userId)
+            }
         }
-        try keychain.saveSession(session, userId: userId, peerId: peerId)
 
         return String(decoding: plaintext, as: UTF8.self)
     }
@@ -409,6 +656,12 @@ final class E2EEManager {
         let identityPrivate = try P256.KeyAgreement.PrivateKey(derRepresentation: identityPrivateData)
         let remoteIdentityPublic = try P256.KeyAgreement.PublicKey(derRepresentation: remoteIdentityData)
         let remoteSignedPreKeyPublic = try P256.KeyAgreement.PublicKey(derRepresentation: remoteSignedPreKeyData)
+        guard let signingData = Data(base64Encoded: bundle.signingPublicKey ?? ""),
+              let signatureData = Data(base64Encoded: bundle.signedPreKeySignature),
+              (bundle.oneTimePreKeyId == nil) == (bundle.oneTimePreKey == nil) else { throw E2EEError.invalidRemoteBundle }
+        let signer = try P256.Signing.PublicKey(derRepresentation: signingData)
+        let signature = try P256.Signing.ECDSASignature(rawRepresentation: signatureData)
+        guard signer.isValidSignature(signature, for: remoteSignedPreKeyData) else { throw E2EEError.invalidRemoteBundle }
         let ephemeral = P256.KeyAgreement.PrivateKey()
 
         var dhResults = Data()
@@ -460,8 +713,8 @@ final class E2EEManager {
     /// delivery derive the same root and receiving chain on both platforms.
     private func acceptPreKeyMessage(_ envelope: SignalEnvelope, userId: String, peerId: String) throws -> E2EESessionData {
         guard let ephemeralKey = envelope.senderEphemeralKey,
-              let signedPreKeyId = envelope.recipientSignedPreKeyId,
-              signedPreKeyId == 1,
+              let signedPreKeyId = envelope.recipientSignedPreKeyId ?? envelope.usedSignedPreKeyId,
+              signedPreKeyId == (try requireRegistration(userId: userId)).signedPreKey.id,
               let identityPrivateData = Data(base64Encoded: try requireRegistration(userId: userId).identityKeyPair.privKey),
               let signedPrivateData = Data(base64Encoded: try requireRegistration(userId: userId).signedPreKey.keyPair.privKey),
               let senderIdentityData = Data(base64Encoded: envelope.senderIdentityKey),
@@ -482,9 +735,11 @@ final class E2EEManager {
         dhResults.append(try sharedSecret(identityPrivate, senderEphemeral))
         dhResults.append(try sharedSecret(signedPrivate, senderEphemeral))
 
-        if let preKeyId = envelope.recipientOneTimePreKeyId,
-           let preKey = try keychain.loadPreKeys(userId: userId).first(where: { $0.id == preKeyId }),
-           let privateData = Data(base64Encoded: preKey.keyPair.privKey) {
+        if let preKeyId = envelope.recipientOneTimePreKeyId ?? envelope.usedOneTimePreKeyId {
+            guard let preKey = try keychain.loadPreKeys(userId: userId).first(where: { $0.id == preKeyId }),
+                  let privateData = Data(base64Encoded: preKey.keyPair.privKey) else {
+                throw E2EEError.missingOneTimePreKey
+            }
             let oneTimePrivate = try P256.KeyAgreement.PrivateKey(derRepresentation: privateData)
             dhResults.append(try sharedSecret(oneTimePrivate, senderEphemeral))
             // Only consume the key after AES-GCM authentication has succeeded.
@@ -511,7 +766,7 @@ final class E2EEManager {
             localRegistrationId: registration.registrationId,
             localIdentityKey: registration.identityKeyPair.pubKey,
             ephemeralKey: nil,
-            usedOneTimePreKeyId: envelope.recipientOneTimePreKeyId,
+            usedOneTimePreKeyId: envelope.recipientOneTimePreKeyId ?? envelope.usedOneTimePreKeyId,
             recipientSignedPreKeyId: nil,
             recipientOneTimePreKeyId: nil,
             ratchetState: E2EERatchetState(
@@ -555,6 +810,19 @@ final class E2EEManager {
         updated.ratchetState.receiveChainKey = Data(receiveDerived.suffix(32)).base64EncodedString()
         updated.ratchetState.sendChainKey = Data(sendDerived.suffix(32)).base64EncodedString()
         return updated
+    }
+
+    private func skipReceiveKeys(_ state: inout E2EERatchetState, until: Int) throws {
+        let gap = max(0, until - state.receiveCounter)
+        guard gap <= 128 - state.skippedMessageKeys.count else { throw E2EEError.invalidEnvelope }
+        while state.receiveCounter < until {
+            guard let chain = state.receiveChainKey, let data = Data(base64Encoded: chain),
+                  let remote = state.dhReceivingKey else { throw E2EEError.keyAgreementFailed }
+            let derived = deriveMessageKeys(chainKey: data)
+            state.receiveCounter += 1
+            state.skippedMessageKeys["\(remote):\(state.receiveCounter)"] = derived.messageKey.base64EncodedString()
+            state.receiveChainKey = derived.nextChainKey.base64EncodedString()
+        }
     }
 
     private func generatePreKeys(userId: String, startId: Int, count: Int) throws -> [E2EEPreKeyUpload] {
@@ -631,7 +899,8 @@ final class E2EEManager {
 private struct E2EERegistration: Codable {
     let registrationId: Int
     let identityKeyPair: E2EEKeyPair
-    let signedPreKey: E2EESignedPreKey
+    var signedPreKey: E2EESignedPreKey
+    var signingKeyPair: E2EEKeyPair? = nil
     var nextPreKeyId: Int
 }
 
@@ -696,6 +965,8 @@ private struct E2EESessionData: Codable {
 }
 
 private struct E2EERatchetState: Codable {
+    var skippedMessageKeys: [String: String] = [:]
+    var retiredRatchetKeys: [String] = []
     var dhSendingKeyPair: E2EEKeyPair
     var dhReceivingKey: String?
     var rootKey: String
@@ -710,6 +981,7 @@ private struct E2EERatchetState: Codable {
     var sentPreKey: Bool
 
     private enum CodingKeys: String, CodingKey {
+        case skippedMessageKeys, retiredRatchetKeys
         case dhSendingKeyPair, dhReceivingKey, rootKey, sendChainKey, sendCounter
         case receiveChainKey, receiveCounter, previousSendCounter, remoteIdentityKey
         case remoteRegistrationId, protocolVersion, sentPreKey
@@ -745,6 +1017,8 @@ private struct E2EERatchetState: Codable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        skippedMessageKeys = try container.decodeIfPresent([String: String].self, forKey: .skippedMessageKeys) ?? [:]
+        retiredRatchetKeys = try container.decodeIfPresent([String].self, forKey: .retiredRatchetKeys) ?? []
         dhSendingKeyPair = try container.decode(E2EEKeyPair.self, forKey: .dhSendingKeyPair)
         dhReceivingKey = try container.decodeIfPresent(String.self, forKey: .dhReceivingKey)
         rootKey = try container.decode(String.self, forKey: .rootKey)
@@ -761,9 +1035,41 @@ private struct E2EERatchetState: Codable {
 }
 
 private final class E2EEKeychainStore {
+#if E2EE_REGRESSION_TESTS
+    private var memory: [String: Data] = [:]
+#endif
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let service = "chat.imim.e2ee"
+
+    func removeAccountKeys(userId: String) throws {
+        let matches: (String) -> Bool = {
+            $0 == "registration.\(userId)" || $0 == "prekeys.\(userId)" || $0.hasPrefix("session.\(userId).") ||
+                $0.hasPrefix(Self.verificationPrefix(userId: userId))
+        }
+#if E2EE_REGRESSION_TESTS
+        for account in Array(memory.keys) where matches(account) { memory.removeValue(forKey: account) }
+#else
+        let lookup: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+        if status == errSecItemNotFound { return }
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
+            throw E2EEError.nativeSignalUnavailable
+        }
+        for item in items {
+            guard let account = item[kSecAttrAccount as String] as? String, matches(account) else { continue }
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service, kSecAttrAccount as String: account]
+            let deleted = SecItemDelete(query as CFDictionary)
+            guard deleted == errSecSuccess || deleted == errSecItemNotFound else {
+                throw E2EEError.nativeSignalUnavailable
+            }
+        }
+#endif
+    }
 
     func loadRegistration(userId: String) throws -> E2EERegistration? {
         try load(E2EERegistration.self, account: "registration.\(userId)")
@@ -791,11 +1097,26 @@ private final class E2EEKeychainStore {
         try load(E2EESessionData.self, account: "session.\(userId).\(peerId)")
     }
 
+    private static func verificationPrefix(userId: String) -> String {
+        "verification.v1." + Data(userId.utf8).base64EncodedString() + "."
+    }
+
+    func loadVerification(userId: String, peerId: String) throws -> E2EEPeerVerification? {
+        try load(E2EEPeerVerification.self, account: Self.verificationPrefix(userId: userId) + Data(peerId.utf8).base64EncodedString())
+    }
+
+    func saveVerification(_ value: E2EEPeerVerification, userId: String, peerId: String) throws {
+        try save(value, account: Self.verificationPrefix(userId: userId) + Data(peerId.utf8).base64EncodedString())
+    }
+
     func saveSession(_ session: E2EESessionData, userId: String, peerId: String) throws {
         try save(session, account: "session.\(userId).\(peerId)")
     }
 
     func deleteSession(userId: String, peerId: String) throws {
+#if E2EE_REGRESSION_TESTS
+        memory.removeValue(forKey: "session.\(userId).\(peerId)")
+#else
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -805,9 +1126,14 @@ private final class E2EEKeychainStore {
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw E2EEError.nativeSignalUnavailable
         }
+#endif
     }
 
     private func load<T: Decodable>(_ type: T.Type, account: String) throws -> T? {
+#if E2EE_REGRESSION_TESTS
+        guard let data = memory[account] else { return nil }
+        return try decoder.decode(T.self, from: data)
+#else
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -822,10 +1148,14 @@ private final class E2EEKeychainStore {
             throw E2EEError.nativeSignalUnavailable
         }
         return try decoder.decode(T.self, from: data)
+#endif
     }
 
     private func save<T: Encodable>(_ value: T, account: String) throws {
         let data = try encoder.encode(value)
+#if E2EE_REGRESSION_TESTS
+        memory[account] = data
+#else
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -848,21 +1178,23 @@ private final class E2EEKeychainStore {
         guard createStatus == errSecSuccess else {
             throw E2EEError.nativeSignalUnavailable
         }
+#endif
     }
 }
 
-private extension DispatchQueue {
-    func asyncThrowing<T>(_ work: @escaping () async throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
-            async {
-                Task {
-                    do {
-                        continuation.resume(returning: try await work())
-                    } catch {
-                        continuation.resume(throwing: error)
-                    }
-                }
-            }
+private actor E2EEOperationQueue {
+    private var tail: Task<Void, Never>?
+
+    // Actor isolation alone is not enough: a fetch suspends and allows reentry.
+    // Chain the whole operation without blocking a thread or the UI actor.
+    func perform<T>(_ work: @escaping () async throws -> T) async throws -> T {
+        let previous = tail
+        let result = Task { () throws -> T in
+            await previous?.value
+            try Task.checkCancellation()
+            return try await work()
         }
+        tail = Task { _ = try? await result.value }
+        return try await result.value
     }
 }

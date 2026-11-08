@@ -1,6 +1,117 @@
 import Foundation
 import Combine
 
+enum PeerPresenceEvent: Sendable {
+    case user(String, online: Bool)
+    case onlineList([String])
+
+    init?(data: Data) {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = object["type"] as? String,
+              let payload = object["payload"] as? [String: Any] else { return nil }
+        switch type {
+        case "friend_online", "friend_offline":
+            guard let id = payload["userId"] as? String, !id.isEmpty, id.count <= 256 else { return nil }
+            self = .user(id, online: type == "friend_online")
+        case "online_users_list":
+            guard let ids = payload["userIds"] as? [String], ids.allSatisfy({ !$0.isEmpty && $0.count <= 256 }) else { return nil }
+            self = .onlineList(ids)
+        default: return nil
+        }
+    }
+}
+
+/// Transient server observations, not another contact database. Account and
+/// connection generations prevent stale HTTP callbacks from reviving green dots.
+@MainActor
+final class FriendPresenceStore: ObservableObject {
+    static let shared = FriendPresenceStore()
+    @Published private(set) var peers: [String: RemotePeerPresence] = [:]
+    private var owner: String?
+    private var ownerToken: String?
+    private var generation = UUID()
+    private var revisions: [String: Int] = [:]
+    private var trackedIDs = Set<String>()
+
+    func snapshot(for id: String?) -> RemotePeerPresence? {
+        guard let id, owner == UserDefaults.standard.string(forKey: "current_user_id"),
+              let token = AuthTokenStore.shared.token, token == ownerToken else { return nil }
+        return peers[id]
+    }
+
+    func invalidate() {
+        generation = UUID()
+        peers.removeAll()
+        revisions.removeAll()
+        trackedIDs.removeAll()
+        owner = UserDefaults.standard.string(forKey: "current_user_id")
+        ownerToken = AuthTokenStore.shared.token
+    }
+
+    private func synchronizeOwner() {
+        if owner != UserDefaults.standard.string(forKey: "current_user_id") || ownerToken != AuthTokenStore.shared.token { invalidate() }
+    }
+
+    func apply(_ event: PeerPresenceEvent) {
+        synchronizeOwner()
+        guard let owner, AuthTokenStore.shared.token != nil else { return }
+        switch event {
+        case .user(let id, let online):
+            guard id != owner, trackedIDs.contains(id) else { return }
+            revisions[id, default: 0] += 1
+            peers[id] = RemotePeerPresence(userId: id, online: online,
+                lastSeen: online ? nil : Int64(Date().timeIntervalSince1970 * 1_000))
+        case .onlineList(let ids):
+            // The signal snapshot is node-local; absence is NOT proof of offline.
+            for id in Set(ids) where id != owner && trackedIDs.contains(id) {
+                revisions[id, default: 0] += 1
+                peers[id] = RemotePeerPresence(userId: id, online: true, lastSeen: nil)
+            }
+        }
+    }
+
+    func refresh(_ id: String) async {
+        synchronizeOwner()
+        guard !id.isEmpty, let owner, let token = AuthTokenStore.shared.token else { return }
+        trackedIDs.insert(id)
+        revisions[id, default: 0] += 1
+        let ticket = generation, revision = revisions[id, default: 0]
+        do {
+            let value = try await APIClient.shared.fetchPeerPresence(userId: id)
+            guard !Task.isCancelled, ticket == generation,
+                  owner == UserDefaults.standard.string(forKey: "current_user_id"),
+                  token == AuthTokenStore.shared.token, revision == revisions[id, default: 0], value.userId == id else { return }
+            peers[id] = value
+        } catch {
+            guard !Task.isCancelled, ticket == generation, revision == revisions[id, default: 0],
+                  owner == UserDefaults.standard.string(forKey: "current_user_id"), token == AuthTokenStore.shared.token else { return }
+            peers[id] = nil // Unknown, never turn a transport failure into "offline".
+        }
+    }
+
+    func refreshFriends() async {
+        synchronizeOwner()
+        guard let owner, let token = AuthTokenStore.shared.token else { return }
+        let ticket = generation, before = revisions
+        do {
+            let friends = try await APIClient.shared.fetchFriends()
+            guard !Task.isCancelled, ticket == generation,
+                  owner == UserDefaults.standard.string(forKey: "current_user_id"), token == AuthTokenStore.shared.token else { return }
+            for friend in friends where before[friend.id, default: 0] == revisions[friend.id, default: 0] {
+                trackedIDs.insert(friend.id)
+                revisions[friend.id, default: 0] += 1
+                if let online = friend.online {
+                    peers[friend.id] = RemotePeerPresence(userId: friend.id, online: online, lastSeen: friend.lastSeen)
+                } else { peers[friend.id] = nil }
+            }
+        } catch {
+            guard !Task.isCancelled, ticket == generation,
+                  owner == UserDefaults.standard.string(forKey: "current_user_id"), token == AuthTokenStore.shared.token else { return }
+            for id in Array(peers.keys) where before[id, default: 0] == revisions[id, default: 0] { peers[id] = nil }
+        }
+    }
+}
+
 class SocketManager: NSObject, ObservableObject {
     static let shared = SocketManager()
 
@@ -8,8 +119,10 @@ class SocketManager: NSObject, ObservableObject {
     @Published var lastReceivedMessage: Message?
 
     private var webSocketTask: URLSessionWebSocketTask?
+    private var connectAttempt = UUID()
+    private var proxyObserver: NSObjectProtocol?
     private var url: URL {
-        var components = URLComponents(string: "wss://wed.imim.chat/signal")!
+        var components = URLComponents(string: AppServer.signalURL)!
         let token = AuthTokenStore.shared.token
         let userId = UserDefaults.standard.string(forKey: "current_user_id") ?? "ios"
         components.queryItems = [
@@ -23,9 +136,14 @@ class SocketManager: NSObject, ObservableObject {
     private var isBackgrounded = false
     private var reconnectEnabled = false
     private var lastEncryptionResetRequest: [String: Date] = [:]
+    private var groupSubscriptions = Set<String>()
 
     private override init() {
         super.init()
+        proxyObserver = NotificationCenter.default.addObserver(forName: .imimProxySessionDidChange,
+            object: nil, queue: .main) { [weak self] _ in
+                self?.connect()
+            }
     }
 
     func connect() {
@@ -36,11 +154,26 @@ class SocketManager: NSObject, ObservableObject {
 
         reconnectEnabled = true
         closeConnection()
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: OperationQueue())
-        webSocketTask = session.webSocketTask(with: url)
-        webSocketTask?.resume()
-        receiveMessage()
-        startPinging()
+        let attempt = connectAttempt
+        let endpoint = url
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let task = try await ProxySession.shared.webSocketTask(with: endpoint)
+                guard self.connectAttempt == attempt, self.reconnectEnabled, !self.isBackgrounded else {
+                    task.cancel(with: .goingAway, reason: nil)
+                    return
+                }
+                task.delegate = self
+                self.webSocketTask = task
+                task.resume()
+                self.receiveMessage()
+                self.startPinging()
+            } catch {
+                guard self.connectAttempt == attempt else { return }
+                self.isConnected = false
+            }
+        }
     }
 
     func disconnect() {
@@ -104,6 +237,18 @@ class SocketManager: NSObject, ObservableObject {
                 "messageIds": messageIds
             ]
         ])
+    }
+
+    func joinGroup(_ groupId: String) {
+        guard !groupId.isEmpty else { return }
+        groupSubscriptions.insert(groupId)
+        sendJSON(["type": "group_join", "payload": ["groupId": groupId]])
+    }
+
+    func leaveGroup(_ groupId: String) {
+        guard !groupId.isEmpty else { return }
+        groupSubscriptions.remove(groupId)
+        sendJSON(["type": "group_leave", "payload": ["groupId": groupId]])
     }
 
     func sendRecall(messageId: String, to peerId: String?) {
@@ -176,18 +321,66 @@ class SocketManager: NSObject, ObservableObject {
                     break
                 }
                 self.receiveMessage() // 继续监听
-            case .failure(let error):
-                print("WebSocket 接收失败: \(error)")
+            case .failure:
                 DispatchQueue.main.async {
+                    guard self.webSocketTask === task, !self.isBackgrounded else { return }
                     self.isConnected = false
+                    FriendPresenceStore.shared.invalidate()
+                    self.scheduleReconnect()
                 }
-                self.scheduleReconnect()
             }
         }
     }
 
     private func handleIncomingMessage(_ text: String) {
         guard let data = text.data(using: .utf8) else { return }
+
+        if let event = PeerPresenceEvent(data: data) {
+            let attempt = connectAttempt
+            DispatchQueue.main.async {
+                guard self.connectAttempt == attempt, !self.isBackgrounded else { return }
+                FriendPresenceStore.shared.apply(event)
+            }
+            return
+        }
+
+        // Group fanout is a top-level payload (unlike private messages, which
+        // are wrapped in `payload`). Decode and decrypt it before the generic
+        // socket envelope so foreground group messages appear immediately.
+        if let groupPush = try? JSONDecoder().decode(SocketGroupMessage.self, from: data),
+           groupPush.type == "group_message" {
+            let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
+            Task { [weak self] in
+                guard let self else { return }
+                let message = await groupPush.remoteMessage.toLocalMessageResolvingMLS(
+                    currentUserId: currentUserId,
+                    groupId: groupPush.groupId
+                )
+                let messageBox = SocketMessageTransferBox(message)
+                await MainActor.run {
+                    let message = messageBox.message
+                    self.lastReceivedMessage = message
+                    NotificationCenter.default.post(
+                        name: .cqimPrivateMessageDidReceive,
+                        object: message,
+                        userInfo: ["ack": false]
+                    )
+                    if NotificationRouter.shared.activeConversationId != message.chatId,
+                       !ConversationPreferences.isMuted(for: message.chatId) {
+                        PushNotificationManager.shared.showRealtimeMessageBanner(
+                            chatId: message.chatId,
+                            title: groupPush.senderName,
+                            body: "你收到一条加密群消息",
+                            avatarURL: groupPush.senderAvatar,
+                            senderId: groupPush.senderId,
+                            messageId: message.messageId,
+                            decryptedPreview: Self.notificationPreview(for: message)
+                        )
+                    }
+                }
+            }
+            return
+        }
 
         if let envelope = try? JSONDecoder().decode(SocketEnvelope.self, from: data) {
             switch envelope.type {
@@ -201,6 +394,12 @@ class SocketManager: NSObject, ObservableObject {
                 // web message never stalls typing or scrolling.
                 Task { [weak self] in
                     guard let self else { return }
+                    if !isAck {
+                        let claimed = await MainActor.run {
+                            IncomingMessagePersistence.shared.begin(remoteMessage.id, owner: currentUserId)
+                        }
+                        guard claimed else { return }
+                    }
                     let senderName = remoteMessage.senderName?.trimmingCharacters(in: .whitespacesAndNewlines)
                     let notificationTitle = (senderName?.isEmpty == false ? senderName : nil) ?? "新消息"
                     let message: Message
@@ -212,9 +411,19 @@ class SocketManager: NSObject, ObservableObject {
                         message.status = "sent"
                     } else {
                         message = await remoteMessage.toLocalMessageResolvingEncryption(currentUserId: currentUserId)
+                        // Duplicate, delayed or malformed ciphertext must not
+                        // silently force the peer to discard a healthy ratchet.
                     }
 
+                    // `Message` is a mutable SwiftData model. This box performs a
+                    // one-way handoff to the UI actor; the background task does not
+                    // access the model again after this point.
+                    let messageBox = SocketMessageTransferBox(message)
                     await MainActor.run {
+                        let message = messageBox.message
+                        if !isAck {
+                            guard IncomingMessagePersistence.shared.store(message, owner: currentUserId) != nil else { return }
+                        }
                         self.lastReceivedMessage = message
                         NotificationCenter.default.post(
                             name: .cqimPrivateMessageDidReceive,
@@ -234,7 +443,9 @@ class SocketManager: NSObject, ObservableObject {
                                 title: notificationTitle,
                                 body: remoteMessage.msgType == "encrypted" ? "你收到一条加密消息" : "你收到一条新消息",
                                 avatarURL: remoteMessage.senderAvatar,
-                                messageId: message.messageId
+                                senderId: remoteMessage.senderId,
+                                messageId: message.messageId,
+                                decryptedPreview: Self.notificationPreview(for: message)
                             )
                         }
                     }
@@ -258,8 +469,17 @@ class SocketManager: NSObject, ObservableObject {
                     NotificationCenter.default.post(name: .cqimBurnDeleteDidReceive, object: event)
                 }
             case "read_receipt":
+                guard let payload = envelope.payload,
+                      let receipt = MessageReadReceipt.decode(payload, from: envelope.from) else { return }
+                let owner = UserDefaults.standard.string(forKey: "current_user_id")
+                let token = AuthTokenStore.shared.token
+                let attempt = connectAttempt
                 DispatchQueue.main.async {
-                    NotificationCenter.default.post(name: .cqimReadReceiptDidReceive, object: nil)
+                    guard self.connectAttempt == attempt, token?.isEmpty == false,
+                          AuthTokenStore.shared.token == token else { return }
+                    if IncomingMessagePersistence.shared.applyReadReceipt(receipt, owner: owner) > 0 {
+                        NotificationCenter.default.post(name: .cqimReadReceiptDidReceive, object: receipt)
+                    }
                 }
             case "recall_notify":
                 DispatchQueue.main.async {
@@ -267,11 +487,13 @@ class SocketManager: NSObject, ObservableObject {
                 }
             case "e2ee_session_reset":
                 guard let peerId = envelope.from, !peerId.isEmpty else { return }
-                do {
-                    try E2EEManager.shared.resetSession(with: peerId)
-                    print("[E2EE] peer requested a new session")
-                } catch {
-                    print("[E2EE] unable to reset requested session: \(error.localizedDescription)")
+                Task {
+                    do {
+                        try await E2EEManager.shared.resetSession(with: peerId)
+                        print("[E2EE] peer requested a new session")
+                    } catch {
+                        print("[E2EE] unable to reset requested session: \(error.localizedDescription)")
+                    }
                 }
             case "call_invite":
                 DispatchQueue.main.async {
@@ -288,15 +510,18 @@ class SocketManager: NSObject, ObservableObject {
             case "call_reject":
                 DispatchQueue.main.async {
                     if let from = envelope.callUserInfo["from"] as? String {
-                        CallManager.shared.endCall(forPeerId: from, reason: .declinedElsewhere)
+                        CallManager.shared.endCall(forPeerId: from, callId: envelope.callUserInfo["callId"] as? String, reason: .declinedElsewhere)
                     }
                     NotificationCenter.default.post(name: .cqimCallRejected, object: nil, userInfo: envelope.callUserInfo)
                 }
             case "call_end":
                 DispatchQueue.main.async {
                     if let from = envelope.callUserInfo["from"] as? String {
-                        CallManager.shared.endCall(forPeerId: from, reason: .remoteEnded)
+                        CallManager.shared.endCall(forPeerId: from, callId: envelope.callUserInfo["callId"] as? String, reason: .remoteEnded)
                     }
+                    #if DEBUG
+                    print("[CallAudio] event=call_end_signal hasCallId=\(envelope.callUserInfo["callId"] != nil)")
+                    #endif
                     NotificationCenter.default.post(name: .cqimCallEnded, object: nil, userInfo: envelope.callUserInfo)
                 }
             case "error":
@@ -328,24 +553,31 @@ class SocketManager: NSObject, ObservableObject {
     private func startPinging() {
         pingTimer?.invalidate()
         pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.webSocketTask?.sendPing { error in
-                if let error = error {
-                    print("WebSocket Ping 失败: \(error)")
-                    self?.isConnected = false
+            guard let task = self?.webSocketTask else { return }
+            task.sendPing { [weak self] error in
+                guard error != nil else { return }
+                DispatchQueue.main.async {
+                    guard let self, self.webSocketTask === task, !self.isBackgrounded else { return }
+                    self.isConnected = false
+                    FriendPresenceStore.shared.invalidate()
                 }
             }
         }
     }
 
     private func closeConnection() {
+        connectAttempt = UUID()
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         pingTimer?.invalidate()
         pingTimer = nil
+        let attempt = connectAttempt
         DispatchQueue.main.async {
+            guard self.connectAttempt == attempt else { return }
             self.isConnected = false
+            FriendPresenceStore.shared.invalidate()
         }
     }
 
@@ -359,6 +591,44 @@ class SocketManager: NSObject, ObservableObject {
         }
         reconnectWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: workItem)
+    }
+}
+
+private struct SocketGroupMessage: Decodable {
+    let type: String
+    let groupId: String
+    let seq: Int
+    let senderId: String
+    let senderName: String
+    let senderAvatar: String?
+    let msgType: String
+    let content: String
+    let replyToId: String?
+    let extra: RemoteMessageExtra?
+    let timestamp: Int64
+
+    var remoteMessage: RemoteGroupMessage {
+        RemoteGroupMessage(
+            id: "\(groupId):\(seq)",
+            seq: seq,
+            senderId: senderId,
+            senderName: senderName,
+            senderAvatar: senderAvatar,
+            msgType: msgType,
+            content: content,
+            replyToId: replyToId,
+            extra: extra,
+            createdAt: ISO8601DateFormatter().string(from: Date(milliseconds: timestamp)),
+            isRevoked: false
+        )
+    }
+}
+
+private final class SocketMessageTransferBox: @unchecked Sendable {
+    let message: Message
+
+    init(_ message: Message) {
+        self.message = message
     }
 }
 
@@ -503,8 +773,33 @@ extension Notification.Name {
 }
 
 extension SocketManager: URLSessionWebSocketDelegate {
+    @MainActor
+    private static func notificationPreview(for message: Message) -> String? {
+        guard message.burnAfterRead == nil, !message.content.hasPrefix("🔒") else { return nil }
+        switch message.type {
+        case "image": return "[图片]"
+        case "video": return "[视频]"
+        case "voice", "audio": return "[语音]"
+        case "file": return "[文件]"
+        case "sticker": return "[贴纸]"
+        default:
+            if let data = message.content.data(using: .utf8),
+               let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // MLS may return its structured inner content. Never preview an envelope.
+                guard value["ciphertext"] == nil, value["ct"] == nil,
+                      let text = value["content"] as? String else { return nil }
+                return NotificationPreview.shortText(text)
+            }
+            return NotificationPreview.shortText(message.content)
+        }
+    }
+
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         DispatchQueue.main.async {
+            guard self.webSocketTask === webSocketTask, !self.isBackgrounded else { return }
+            for groupId in self.groupSubscriptions {
+                self.sendJSON(["type": "group_join", "payload": ["groupId": groupId]])
+            }
             self.isConnected = true
             print("WebSocket 已连接")
         }
@@ -512,7 +807,9 @@ extension SocketManager: URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         DispatchQueue.main.async {
+            guard self.webSocketTask === webSocketTask else { return }
             self.isConnected = false
+            FriendPresenceStore.shared.invalidate()
             print("WebSocket 已关闭")
         }
     }

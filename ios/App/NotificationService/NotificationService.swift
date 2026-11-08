@@ -3,202 +3,192 @@ import UIKit
 import UserNotifications
 
 final class NotificationService: UNNotificationServiceExtension {
+    // NSE entry points, URLSession and Intents callbacks may use different
+    // threads. Confine all request state to one queue; never block a callback.
+    private let deliveryQueue = DispatchQueue(label: "chat.imim.notification-delivery")
+    private var requestID: UUID?
     private var contentHandler: ((UNNotificationContent) -> Void)?
-    private var bestAttemptContent: UNMutableNotificationContent?
-    private var hasCompleted = false
+    private var originalContent: UNNotificationContent?
+    private var deadline: DispatchWorkItem?
+    private var session: URLSession?
 
     override func didReceive(
         _ request: UNNotificationRequest,
         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
-        self.contentHandler = contentHandler
-        hasCompleted = false
+        deliveryQueue.async { [self] in
+            finish(originalContent)
+            let id = UUID()
+            requestID = id
+            self.contentHandler = contentHandler
+            originalContent = request.content
 
-        guard let content = request.content.mutableCopy() as? UNMutableNotificationContent else {
-            finish(request.content)
-            return
-        }
-        bestAttemptContent = content
+            let fields = request.content.userInfo
+            // Decrypt only the dedicated preview box, never a chat ratchet.
+            if stringValue(fields["type"]) != "call_invite",
+               let decrypted = request.content.mutableCopy() as? UNMutableNotificationContent {
+                decrypted.body = NotificationPreview.notificationBody(fields: fields)
+                originalContent = decrypted
+            }
+            guard stringValue(fields["type"]) != "call_invite",
+                  let senderID = stringValue(fields["senderId"]),
+                  let senderName = stringValue(fields["senderName"]),
+                  let chatID = stringValue(fields["chatId"]),
+                  let avatarURL = validatedHTTPSURL(stringValue(fields["avatarUrl"])) else {
+                finish(originalContent)
+                return
+            }
 
-        let userInfo = content.userInfo
-        let pushType = userInfo["type"] as? String
-        guard pushType != "call_invite" else {
-            // Calls remain on their existing CallKit / VoIP path. Text messages
-            // are the only payloads converted to communication notifications.
-            finish(content)
-            return
-        }
-
-        let chatId = stringValue(userInfo["chatId"]) ?? stringValue(userInfo["conversationId"]) ?? ""
-        let senderId = stringValue(userInfo["senderId"]) ?? stringValue(userInfo["sender_id"]) ?? ""
-        let senderName = stringValue(userInfo["sender_name"])
-            ?? stringValue(userInfo["senderName"])
-            ?? content.title.nilIfBlank
-            ?? "新消息"
-
-        // E2EE previews must never expose plaintext or ciphertext on the lock
-        // screen. The server also sends this value, but enforce it here so a
-        // malformed payload remains private.
-        content.title = senderName
-        content.body = "加密消息"
-        content.categoryIdentifier = "MESSAGE"
-        if !chatId.isEmpty {
-            content.threadIdentifier = chatId
-        }
-
-        let avatarURL = validatedHTTPSURL(stringValue(userInfo["sender_avatar"]))
-        if let avatarURL {
-            downloadAvatar(from: avatarURL) { [weak self] avatar in
-                self?.applyMessageIntent(
-                    to: content,
-                    senderId: senderId,
-                    senderName: senderName,
-                    chatId: chatId,
-                    avatar: avatar
+            // Includes the Intents donation, not just the avatar download.
+            let timeout = DispatchWorkItem { [weak self] in
+                guard let self, self.requestID == id else { return }
+                self.finish(self.originalContent)
+            }
+            deadline = timeout
+            deliveryQueue.asyncAfter(deadline: .now() + 4, execute: timeout)
+            downloadAvatar(from: avatarURL, requestID: id) { [weak self] imageData in
+                guard let self, self.requestID == id else { return }
+                guard let imageData else {
+                    self.finish(self.originalContent)
+                    return
+                }
+                self.applyMessageIntent(
+                    to: self.originalContent ?? request.content, requestID: id,
+                    senderID: senderID, senderName: senderName,
+                    chatID: chatID, imageData: imageData
                 )
             }
-        } else {
-            applyMessageIntent(
-                to: content,
-                senderId: senderId,
-                senderName: senderName,
-                chatId: chatId,
-                avatar: nil
-            )
         }
     }
 
     private func applyMessageIntent(
-        to content: UNMutableNotificationContent,
-        senderId: String,
-        senderName: String,
-        chatId: String,
-        avatar: AvatarResource?
+        to content: UNNotificationContent, requestID id: UUID,
+        senderID: String, senderName: String, chatID: String, imageData: Data
     ) {
-        let handle = INPersonHandle(
-            value: senderId.nilIfBlank ?? senderName,
-            type: .unknown
-        )
-        let senderImage = avatar.flatMap { INImage(url: $0.fileURL) }
+        let intent = messageIntent(to: content, senderID: senderID, senderName: senderName,
+                                   chatID: chatID, imageData: imageData)
+        let interaction = INInteraction(intent: intent, response: nil)
+        interaction.direction = .incoming
+        interaction.donate { [weak self] error in
+            guard let self else { return }
+            self.deliveryQueue.async {
+                guard self.requestID == id else { return }
+                guard error == nil else {
+                    self.finish(self.originalContent)
+                    return
+                }
+                do {
+                    // The system owns the avatar layout and App icon overlay.
+                    self.finish(try content.updating(from: intent))
+                } catch {
+                    self.finish(self.originalContent)
+                }
+            }
+        }
+    }
+
+    private func messageIntent(
+        to content: UNNotificationContent,
+        senderID: String, senderName: String, chatID: String, imageData: Data
+    ) -> INSendMessageIntent {
+        let senderImage = INImage(imageData: imageData)
         let sender = INPerson(
-            personHandle: handle,
+            personHandle: INPersonHandle(value: senderID, type: .unknown),
             nameComponents: nil,
             displayName: senderName,
             image: senderImage,
             contactIdentifier: nil,
-            customIdentifier: senderId.nilIfBlank
-        )
-        let recipient = INPerson(
-            personHandle: INPersonHandle(value: "me", type: .unknown),
-            nameComponents: nil,
-            displayName: "我",
-            image: nil,
-            contactIdentifier: nil,
-            customIdentifier: "me"
+            customIdentifier: senderID
         )
         let intent = INSendMessageIntent(
-            recipients: [recipient],
+            // iOS implicitly adds the current user for an incoming donation.
+            recipients: nil,
             outgoingMessageType: .outgoingMessageText,
             content: content.body,
             speakableGroupName: nil,
-            conversationIdentifier: chatId.nilIfBlank,
-            serviceName: "imimchat",
+            conversationIdentifier: chatID,
+            serviceName: "imim",
             sender: sender,
             attachments: nil
         )
-
-        let interaction = INInteraction(intent: intent, response: nil)
-        interaction.direction = INInteractionDirection.incoming
-        interaction.donate(completion: { [weak self] (_: Error?) in
-            guard let self else { return }
-            do {
-                // This gives the notification its system communication layout:
-                // sender avatar plus the App icon badge.
-                self.finish(try content.updating(from: intent))
-            } catch {
-                // Attachments are deliberately a fallback. They cannot replace
-                // the communication layout, but still give a useful visual
-                // notification when Intents is unavailable.
-                if let attachment = avatar?.attachment {
-                    content.attachments = [attachment]
-                }
-                self.finish(content)
-            }
-        })
+        intent.setImage(senderImage, forParameterNamed: \.sender)
+        return intent
     }
 
-    private func downloadAvatar(from url: URL, completion: @escaping (AvatarResource?) -> Void) {
+    private func downloadAvatar(
+        from url: URL, requestID id: UUID, completion: @escaping (Data?) -> Void
+    ) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 2
         configuration.timeoutIntervalForResource = 2
         configuration.waitsForConnectivity = false
-
-        URLSession(configuration: configuration).dataTask(with: url) { data, response, error in
-            guard error == nil,
-                  let response = response as? HTTPURLResponse,
-                  (200..<300).contains(response.statusCode),
-                  let data,
-                  !data.isEmpty,
-                  data.count <= 64 * 1_024,
-                  let image = UIImage(data: data),
-                  let imageData = image.jpegData(compressionQuality: 0.82) else {
-                completion(nil)
-                return
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        let session = URLSession(configuration: configuration)
+        self.session = session
+        // Download to a temporary file so a large response cannot fill the
+        // extension's memory before we get a chance to check its size.
+        session.downloadTask(with: url) { [weak self] fileURL, response, error in
+            guard let self else { return }
+            let imageData: Data?
+            if error == nil,
+               let response = response as? HTTPURLResponse,
+               (200..<300).contains(response.statusCode),
+               response.url?.scheme?.lowercased() == "https",
+               let fileURL,
+               let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+               let size = attributes[.size] as? NSNumber,
+               size.intValue > 0, size.intValue <= 1_024 * 1_024,
+               let data = try? Data(contentsOf: fileURL),
+               let image = UIImage(data: data),
+               image.size.width <= 2_048, image.size.height <= 2_048 {
+                imageData = data
+            } else {
+                imageData = nil
             }
-
-            let fileURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("notification-avatar-\(UUID().uuidString).jpg")
-            do {
-                try imageData.write(to: fileURL, options: .atomic)
-                let attachment = try? UNNotificationAttachment(
-                    identifier: "sender_avatar_fallback",
-                    url: fileURL,
-                    options: nil
-                )
-                completion(AvatarResource(fileURL: fileURL, attachment: attachment))
-            } catch {
-                completion(nil)
+            self.deliveryQueue.async {
+                guard self.requestID == id else { return }
+                completion(imageData)
             }
         }.resume()
     }
 
     private func validatedHTTPSURL(_ value: String?) -> URL? {
-        guard let value,
-              let url = URL(string: value),
-              url.scheme?.lowercased() == "https",
-              url.host?.isEmpty == false else {
-            return nil
-        }
+        guard let value, let url = URL(string: value),
+              url.scheme?.lowercased() == "https", url.host?.isEmpty == false,
+              url.user == nil, url.password == nil else { return nil }
         return url
     }
 
     private func stringValue(_ value: Any?) -> String? {
         guard let value = value as? String else { return nil }
-        return value.nilIfBlank
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
-    private func finish(_ content: UNNotificationContent) {
-        guard !hasCompleted else { return }
-        hasCompleted = true
-        contentHandler?(content)
+    // Called only on deliveryQueue. Clearing the handler before invocation
+    // prevents timeout / expiry / late download from delivering twice.
+    private func finish(_ content: UNNotificationContent?) {
+        guard let handler = contentHandler, let content else { return }
         contentHandler = nil
+        requestID = nil
+        deadline?.cancel()
+        deadline = nil
+        session?.invalidateAndCancel()
+        session = nil
+        originalContent = nil
+        // Recheck privacy if it changed while downloading/donating.
+        if stringValue(content.userInfo["type"]) != "call_invite",
+           let final = content.mutableCopy() as? UNMutableNotificationContent {
+            // Includes account logout/switch, missing key and privacy changes.
+            final.body = NotificationPreview.notificationBody(fields: content.userInfo)
+            handler(final)
+        } else { handler(content) }
     }
 
     override func serviceExtensionTimeWillExpire() {
-        if let bestAttemptContent {
-            finish(bestAttemptContent)
+        deliveryQueue.async { [self] in
+            finish(originalContent)
         }
-    }
-}
-
-private struct AvatarResource {
-    let fileURL: URL
-    let attachment: UNNotificationAttachment?
-}
-
-private extension String {
-    var nilIfBlank: String? {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }

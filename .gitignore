@@ -4,3 +4,9 @@ ios/App/Downloads/
 ios/App/Packages/
 ios/App/**/*.xcuserstate
 ios/App/**/xcuserdata/
+
+# Local build dependencies and backup files
+ios/App/Pods/
+ios/App/Pods
+ios/App/Packages
+*.orig

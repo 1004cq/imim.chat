@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import CallKit
 import UIKit
 
@@ -86,11 +87,14 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
     private let provider: CXProvider
     private let controller = CXCallController()
     private var calls: [UUID: IncomingCallDescriptor] = [:]
+    private var historyTokens: [UUID: CallHistoryStore.Token] = [:]
     private var pendingAcceptedCall: IncomingCallDescriptor?
     private var silentEndRequests: Set<UUID> = []
+    private let waitingFeedback = CallWaitingFeedback()
+    private var feedbackObservers: [NSObjectProtocol] = []
 
     private override init() {
-        let config = CXProviderConfiguration(localizedName: "imm")
+        let config = CXProviderConfiguration()
         config.ringtoneSound = "call_incoming.caf"
         config.supportsVideo = true
         config.maximumCallsPerCallGroup = 1
@@ -103,11 +107,16 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
         provider = CXProvider(configuration: config)
         super.init()
         provider.setDelegate(self, queue: .main)
+        for name in [UIApplication.willResignActiveNotification, UIApplication.didBecomeActiveNotification] {
+            feedbackObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.waitingFeedback.refreshIncomingActivity() }
+            })
+        }
     }
 
     func start() {}
 
-    func reportIncoming(_ descriptor: IncomingCallDescriptor, fromVoIPPush: Bool = false, completion: @escaping (Error?) -> Void) {
+    func reportIncoming(_ descriptor: IncomingCallDescriptor, fromVoIPPush: Bool = false, recordHistory: Bool = true, completion: @escaping (Error?) -> Void) {
         let existingCall = calls[descriptor.uuid]
         // Foreground events may be deduplicated locally. Every PushKit delivery must
         // still reach CallKit, even when the matching WebSocket invite arrived first.
@@ -117,6 +126,13 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
         }
         if existingCall == nil {
             calls[descriptor.uuid] = descriptor
+            if recordHistory {
+                historyTokens[descriptor.uuid] = CallHistoryStore.shared.begin(callID: descriptor.callId,
+                    peerID: descriptor.peerId, mediaKind: descriptor.isVideo ? "video" : "audio", isIncoming: true)
+            }
+            // Only foreground haptics are app-owned. CallKit owns the ringtone
+            // and background/locked alerts, including the user's system settings.
+            waitingFeedback.startIncoming(id: descriptor.uuid.uuidString)
         }
         let reportedCall = existingCall ?? descriptor
         let update = CXCallUpdate()
@@ -132,8 +148,13 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
                 // A duplicate UUID is rejected by CallKit without ending the original
                 // call. Only a failed first report owns the provisional state to remove.
                 if error != nil, existingCall == nil {
+                    CallHistoryStore.shared.finish(self?.historyTokens.removeValue(forKey: descriptor.uuid), reason: .failed)
                     self?.calls.removeValue(forKey: descriptor.uuid)
+                    self?.waitingFeedback.stop(id: descriptor.uuid.uuidString)
                 }
+                #if DEBUG
+                print("[CallAudio] event=incoming_report success=\(error == nil) foreground=\(UIApplication.shared.applicationState == .active) customRingtone=\(Bundle.main.url(forResource: "call_incoming", withExtension: "caf") != nil)")
+                #endif
                 completion(error)
             }
         }
@@ -143,19 +164,29 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
         let descriptor = IncomingCallDescriptor(
             uuid: UUID(), callId: "invalid-\(UUID().uuidString)", peerId: "unknown", peerName: "来电", peerAvatar: nil, roomId: "", isVideo: false
         )
-        reportIncoming(descriptor) { [weak self] _ in
+        reportIncoming(descriptor, recordHistory: false) { [weak self] _ in
             self?.end(uuid: descriptor.uuid, reason: .failed, notifyRemote: false)
             completion()
         }
     }
 
     func accept(uuid: UUID) {
+        waitingFeedback.stop(id: uuid.uuidString)
         controller.request(CXTransaction(action: CXAnswerCallAction(call: uuid))) { error in
             if let error { print("[CallKit] accept request failed: \(error.localizedDescription)") }
         }
     }
 
     func end(uuid: UUID, reason: CXCallEndedReason = .remoteEnded, notifyRemote: Bool = true) {
+        waitingFeedback.stop(id: uuid.uuidString)
+        let historyReason: CallHistoryStore.EndReason
+        switch reason {
+        case .failed: historyReason = .failed
+        case .unanswered: historyReason = .unanswered
+        case .declinedElsewhere: historyReason = .declined
+        default: historyReason = notifyRemote ? .endedLocally : .endedRemotely
+        }
+        CallHistoryStore.shared.finish(historyTokens.removeValue(forKey: uuid), reason: historyReason)
         if !notifyRemote { silentEndRequests.insert(uuid) }
         provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
         controller.request(CXTransaction(action: CXEndCallAction(call: uuid))) { error in
@@ -163,8 +194,12 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
         }
     }
 
-    func endCall(forPeerId peerId: String, reason: CXCallEndedReason) {
-        guard let uuid = calls.first(where: { $0.value.peerId == peerId })?.key else { return }
+    func endCall(forPeerId peerId: String, callId: String? = nil, reason: CXCallEndedReason) {
+        guard let uuid = calls.first(where: {
+            guard $0.value.peerId == peerId else { return false }
+            guard let callId, !callId.isEmpty else { return true }
+            return $0.value.callId == callId || $0.key.uuidString == callId
+        })?.key else { return }
         end(uuid: uuid, reason: reason, notifyRemote: false)
     }
 
@@ -183,25 +218,40 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
     }
 
     func providerDidReset(_ provider: CXProvider) {
+        waitingFeedback.stop()
+        for token in historyTokens.values { CallHistoryStore.shared.finish(token, reason: .failed) }
+        historyTokens.removeAll()
         calls.removeAll()
         pendingAcceptedCall = nil
-        Task { @MainActor in TRTCManager.shared.handleCallKitAudioSessionDeactivated() }
+        TRTCManager.shared.handleCallKitAudioSessionDeactivated()
     }
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+        guard TRTCManager.shared.prepareForCallKitAudioActivation(callType: action.isVideo ? .video : .audio) else {
+            action.fail()
+            return
+        }
         provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
         action.fulfill()
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         guard let descriptor = calls[action.callUUID] else { action.fail(); return }
+        waitingFeedback.stop(id: action.callUUID.uuidString)
+        // Delegate callbacks use queue .main. Configure synchronously before
+        // fulfilling; a queued Task can run after didActivate and erase it.
+        guard TRTCManager.shared.prepareForCallKitAudioActivation(callType: descriptor.isVideo ? .video : .audio) else {
+            action.fail()
+            return
+        }
         pendingAcceptedCall = descriptor
-        Task { @MainActor in TRTCManager.shared.prepareForCallKitAudioActivation() }
         action.fulfill()
         NotificationCenter.default.post(name: .cqimCallAnsweredFromSystem, object: nil, userInfo: descriptor.userInfo)
     }
 
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+        waitingFeedback.stop(id: action.callUUID.uuidString)
+        CallHistoryStore.shared.finish(historyTokens.removeValue(forKey: action.callUUID), reason: .endedLocally)
         let descriptor = calls.removeValue(forKey: action.callUUID)
         let notifyRemote = silentEndRequests.remove(action.callUUID) == nil
         if let descriptor {
@@ -217,10 +267,112 @@ final class CallManager: NSObject, @preconcurrency CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        Task { @MainActor in TRTCManager.shared.handleCallKitAudioSessionActivated(audioSession) }
+        TRTCManager.shared.handleCallKitAudioSessionActivated(audioSession)
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        Task { @MainActor in TRTCManager.shared.handleCallKitAudioSessionDeactivated() }
+        TRTCManager.shared.handleCallKitAudioSessionDeactivated()
     }
 }
+
+// MARK: - Call waiting feedback
+
+/// Main-actor owned, per-call feedback. No AudioSession category, microphone,
+/// route or activation changes: TRTC/CallKit remain the audio-session owners.
+@MainActor
+final class CallWaitingFeedback {
+    struct Playback {
+        let play: @MainActor () -> Void
+        let stop: @MainActor () -> Void
+    }
+    private enum Mode: Equatable { case incoming(String), outgoing(String) }
+    private var mode: Mode?
+    private var playback: Playback?
+    private var hapticTask: Task<Void, Never>?
+    private var generation = UUID()
+    private let makePlayback: @MainActor () -> Playback?
+    private let vibrate: @MainActor () -> Void
+    private let isActive: @MainActor () -> Bool
+    private let interval: Duration
+
+    init(makePlayback: @escaping @MainActor () -> Playback? = CallWaitingFeedback.bundledPlayback,
+         vibrate: @escaping @MainActor () -> Void = { AudioServicesPlaySystemSound(kSystemSoundID_Vibrate) },
+         isActive: @escaping @MainActor () -> Bool = { UIApplication.shared.applicationState == .active },
+         interval: Duration = .milliseconds(2400)) {
+        self.makePlayback = makePlayback
+        self.vibrate = vibrate
+        self.isActive = isActive
+        self.interval = interval
+    }
+
+    deinit { hapticTask?.cancel() }
+
+    func startOutgoing(id: String) {
+        if mode != .outgoing(id) {
+            stop()
+            mode = .outgoing(id)
+            playback = makePlayback()
+        }
+        playback?.play() // Reuse the player; recover if SDK audio activation paused it.
+    }
+
+    func startIncoming(id: String) {
+        if mode != .incoming(id) {
+            stop()
+            mode = .incoming(id)
+        }
+        refreshIncomingActivity()
+    }
+
+    func refreshIncomingActivity() {
+        guard case .incoming = mode else { return }
+        guard isActive() else { cancelHaptics(); return }
+        guard hapticTask == nil else { return }
+        let generation = generation
+        vibrate()
+        let interval = interval
+        hapticTask = Task { @concurrent [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: interval) } catch { return }
+                guard !Task.isCancelled, let self else { return }
+                let keepGoing = await self.pulse(generation: generation)
+                if !keepGoing { return }
+            }
+        }
+    }
+
+    private func pulse(generation: UUID) -> Bool {
+        guard self.generation == generation, case .incoming = mode else { return false }
+        guard isActive() else { cancelHaptics(); return false }
+        vibrate()
+        return true
+    }
+
+    func stop(id: String? = nil) {
+        if let id {
+            guard mode == .incoming(id) || mode == .outgoing(id) else { return }
+        }
+        mode = nil
+        cancelHaptics()
+        playback?.stop()
+        playback = nil
+    }
+
+    private func cancelHaptics() {
+        generation = UUID()
+        hapticTask?.cancel()
+        hapticTask = nil
+    }
+
+    private static func bundledPlayback() -> Playback? {
+        // Existing valid, bundled CAF; ringtone.mp3 is not a playable source.
+        guard let url = Bundle.main.url(forResource: "call_incoming", withExtension: "caf"),
+              let player = try? AVAudioPlayer(contentsOf: url) else { return nil }
+        player.numberOfLoops = -1
+        player.volume = 0.45
+        player.prepareToPlay()
+        return Playback(play: { if !player.isPlaying { player.play() } }, stop: { player.stop() })
+    }
+}
+
+// MARK: - End call waiting feedback

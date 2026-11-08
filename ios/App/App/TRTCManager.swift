@@ -102,6 +102,15 @@ final class TRTCManager: NSObject, ObservableObject {
     @Published private(set) var isFrontCamera = true
     @Published private(set) var isScreenSharing = false
     @Published private(set) var mediaWarning: String?
+    @Published private(set) var isDualCameraEnabled = false
+    @Published private(set) var isChangingCamera = false
+
+    var canStartCameraCapture: Bool { activeRoomId == nil }
+    var canUseDualCamera: Bool { AVCaptureMultiCamSession.isMultiCamSupported && activeCallType == .video }
+    private var dualCamera: DualCameraCaptureEngine?
+    private var dualPreview: DualCameraPreviewSurface?
+    private var dualSink: TRTCCompositeVideoSink?
+    private var cameraTransition = UUID()
 
     private var localView: UIView?
     private var remoteViews: [String: UIView] = [:]
@@ -113,6 +122,9 @@ final class TRTCManager: NSObject, ObservableObject {
     private var localMediaStarted = false
     private var didRetryAudioStart = false
     private var audioStartRetryTask: Task<Void, Never>?
+    #if DEBUG
+    private var lastAudioDiagnosticTime: TimeInterval = 0
+    #endif
 
     private override init() {
         super.init()
@@ -134,7 +146,9 @@ final class TRTCManager: NSObject, ObservableObject {
     func bindLocalPreview(_ view: UIView) {
         localView = view
         #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
-        if isSDKConfigured, activeRoomId != nil, activeCallType == .video, !isCameraOff {
+        if let dualCamera {
+            attachDualPreview(to: view, engine: dualCamera)
+        } else if !isChangingCamera, isSDKConfigured, activeRoomId != nil, activeCallType == .video, !isCameraOff {
             TRTCCloud.sharedInstance().startLocalPreview(isFrontCamera, view: view)
         }
         #endif
@@ -183,7 +197,12 @@ final class TRTCManager: NSObject, ObservableObject {
 
         connectionState = .requestingPermission
 
+        // A composing camera/recorder yields its lease before TRTC acquires video or audio.
+        await DualCameraCaptureEngine.yieldToCall()
+        guard activeRoomId == roomId, !Task.isCancelled else { return }
+
         let permission = await requestMediaPermission(callType: callType)
+        guard activeRoomId == roomId, !Task.isCancelled else { return }
         guard permission else {
             connectionState = .failed("请在系统设置中允许相机/麦克风权限")
             return
@@ -215,9 +234,15 @@ final class TRTCManager: NSObject, ObservableObject {
     }
 
     func exitRoom() {
+        cameraTransition = UUID()
+        dualSink?.invalidate(); dualSink = nil
+        dualCamera?.stop(); dualCamera = nil
+        dualPreview?.removeFromSuperview(); dualPreview = nil
+        isDualCameraEnabled = false; isChangingCamera = false
         #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
         if isSDKConfigured {
             TRTCCloud.sharedInstance().stopLocalPreview()
+            TRTCCloud.sharedInstance().enableCustomVideoCapture(.big, enable: false)
             TRTCCloud.sharedInstance().stopLocalAudio()
             for participant in remoteParticipants {
                 TRTCCloud.sharedInstance().stopRemoteView(participant.id, streamType: .big)
@@ -252,28 +277,43 @@ final class TRTCManager: NSObject, ObservableObject {
         applyMutedState()
     }
 
-    func prepareForCallKitAudioActivation() {
+    @discardableResult
+    func prepareForCallKitAudioActivation(callType: VideoCallType) -> Bool {
+        activeCallType = callType
+        // Configure without taking activation away from CallKit. This must run
+        // before CXAnswerCallAction/CXStartCallAction is fulfilled.
+        guard configureAudioSession(AVAudioSession.sharedInstance(), activate: false) else { return false }
         callKitAudioActivationRequired = true
         callKitAudioSessionActive = false
+        logAudioState("callkit_prepared")
+        return true
     }
 
     func handleCallKitAudioSessionActivated(_ session: AVAudioSession) {
-        if configureAudioSession(session, activate: false) {
-            callKitAudioSessionActive = true
-            if connectionState == .connected {
-                startLocalMediaAfterRoomEntered()
-            }
+        guard callKitAudioActivationRequired else { return }
+        // CallKit has already activated the preconfigured session. Do not change
+        // category/mode here or enqueue work that can reorder this signal.
+        callKitAudioSessionActive = true
+        logAudioState("callkit_activated", session: session)
+        if connectionState == .connected {
+            startLocalMediaAfterRoomEntered()
         }
     }
 
     func handleCallKitAudioSessionDeactivated() {
+        // A late callback from a finished system call must not stop a new call
+        // whose audio session is owned directly by the App.
+        guard callKitAudioActivationRequired else { return }
         callKitAudioSessionActive = false
+        audioStartRetryTask?.cancel()
+        audioStartRetryTask = nil
         #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
         if isSDKConfigured, localMediaStarted {
             TRTCCloud.sharedInstance().stopLocalAudio()
         }
         #endif
         localMediaStarted = false
+        logAudioState("callkit_deactivated")
     }
 
     private func applyMutedState() {
@@ -285,6 +325,12 @@ final class TRTCManager: NSObject, ObservableObject {
     }
 
     func toggleCamera() {
+        guard !isChangingCamera else { return }
+        if dualCamera != nil {
+            // Release custom capture fully before restoring the SDK's own camera.
+            disableDualCamera(turnCameraOff: true)
+            return
+        }
         guard !shouldDisableLocalVideoForCurrentRuntime else {
             isCameraOff = true
             mediaWarning = videoCompatibilityWarning
@@ -307,6 +353,12 @@ final class TRTCManager: NSObject, ObservableObject {
     }
 
     func switchCamera() {
+        guard !isChangingCamera else { return }
+        if let dualCamera {
+            isFrontCamera.toggle()
+            dualCamera.setFrontMain(isFrontCamera)
+            return
+        }
         guard !shouldDisableLocalVideoForCurrentRuntime else {
             isCameraOff = true
             mediaWarning = videoCompatibilityWarning
@@ -319,6 +371,72 @@ final class TRTCManager: NSObject, ObservableObject {
             TRTCCloud.sharedInstance().getDeviceManager().switchCamera(isFrontCamera)
         }
         #endif
+    }
+
+    func toggleDualCamera() {
+        guard !isChangingCamera, activeRoomId != nil, activeCallType == .video, !isCameraOff else { return }
+        if dualCamera != nil { disableDualCamera(turnCameraOff: false); return }
+        guard canUseDualCamera else {
+            mediaWarning = AppLocalization.string("此设备使用单摄拍摄"); return
+        }
+        #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
+        guard isSDKConfigured else { return }
+        let transition = UUID(); cameraTransition = transition
+        isChangingCamera = true
+        let cloud = TRTCCloud.sharedInstance()
+        cloud.stopLocalPreview()
+        cloud.enableCustomVideoCapture(.big, enable: true)
+        let engine = DualCameraCaptureEngine()
+        let sink = TRTCCompositeVideoSink()
+        dualCamera = engine; dualSink = sink
+        // Rear main + front inset on entry; the existing flip control swaps them.
+        isFrontCamera = false
+        if let localView { attachDualPreview(to: localView, engine: engine) }
+        engine.start(onState: { [weak self] running, dual, failure in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.cameraTransition == transition, self.dualCamera === engine else { return }
+                self.isChangingCamera = false
+                self.isDualCameraEnabled = running && dual
+                if let failure { self.mediaWarning = failure.localizedDescription }
+                if !running, failure != .interrupted { self.disableDualCamera(turnCameraOff: false) }
+            }
+        }, onFrame: { buffer, pts in sink.send(buffer, pts: pts) })
+        cloud.muteLocalVideo(.big, mute: false)
+        #endif
+    }
+
+    private func attachDualPreview(to view: UIView, engine: DualCameraCaptureEngine) {
+        dualPreview?.removeFromSuperview()
+        let surface = DualCameraPreviewSurface(frame: view.bounds)
+        surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(surface); dualPreview = surface
+        engine.bindPreview(surface.displayLayer.sampleBufferRenderer)
+    }
+
+    private func disableDualCamera(turnCameraOff: Bool) {
+        guard let engine = dualCamera else { return }
+        let transition = UUID(); cameraTransition = transition
+        isChangingCamera = true; isDualCameraEnabled = false
+        dualSink?.invalidate(); dualSink = nil
+        // Keep the engine identity until the session actually releases the devices.
+        engine.stop { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.cameraTransition == transition else { return }
+                self.dualCamera = nil
+                self.dualPreview?.removeFromSuperview(); self.dualPreview = nil
+                self.isChangingCamera = false; self.isCameraOff = turnCameraOff
+                #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
+                let cloud = TRTCCloud.sharedInstance()
+                cloud.enableCustomVideoCapture(.big, enable: false)
+                if self.activeRoomId != nil {
+                    cloud.muteLocalVideo(.big, mute: turnCameraOff)
+                    if !turnCameraOff, let view = self.localView {
+                        cloud.startLocalPreview(self.isFrontCamera, view: view)
+                    }
+                }
+                #endif
+            }
+        }
     }
 
     func toggleSpeaker() {
@@ -383,7 +501,10 @@ final class TRTCManager: NSObject, ObservableObject {
     private func startLocalMediaAfterRoomEntered() {
         #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
         guard isSDKConfigured else { return }
-        guard !callKitAudioActivationRequired || callKitAudioSessionActive else { return }
+        guard !callKitAudioActivationRequired || callKitAudioSessionActive else {
+            logAudioState("waiting_for_callkit")
+            return
+        }
         guard !localMediaStarted else { return }
 
         if !callKitAudioActivationRequired {
@@ -405,13 +526,14 @@ final class TRTCManager: NSObject, ObservableObject {
             mediaWarning = videoCompatibilityWarning
         } else if activeCallType == .video, let localView {
             isCameraOff = false
-            cloud.startLocalPreview(isFrontCamera, view: localView)
+            if dualCamera == nil, !isChangingCamera { cloud.startLocalPreview(isFrontCamera, view: localView) }
             cloud.muteLocalVideo(.big, mute: false)
         } else {
             isCameraOff = true
         }
 
         setSpeakerEnabled(true)
+        logAudioState("local_audio_started")
         #endif
     }
 
@@ -428,9 +550,27 @@ final class TRTCManager: NSObject, ObservableObject {
             }
             return true
         } catch {
+            #if DEBUG
+            print("[CallAudio] session_error code=\((error as NSError).code)")
+            #endif
             mediaWarning = "无法激活通话音频：\(error.localizedDescription)"
             return false
         }
+    }
+
+    /// Debug-only diagnostics: no user/room IDs, names, tokens or device names.
+    private func logAudioState(_ event: String, session: AVAudioSession = .sharedInstance()) {
+        #if DEBUG
+        let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        print("[CallAudio] event=\(event) kitRequired=\(callKitAudioActivationRequired) kitActive=\(callKitAudioSessionActive) localStarted=\(localMediaStarted) muted=\(isMuted) category=\(session.category.rawValue) mode=\(session.mode.rawValue) input=\(inputs) output=\(outputs) inputAvailable=\(session.isInputAvailable) systemVolume=\(session.outputVolume) micPermission=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)")
+        #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
+        if isSDKConfigured {
+            let cloud = TRTCCloud.sharedInstance()
+            print("[CallAudio] captureVolume=\(cloud.getAudioCaptureVolume()) playoutVolume=\(cloud.getAudioPlayoutVolume()) peers=\(remoteParticipants.count) audioPeers=\(remoteParticipants.filter { $0.hasAudio }.count)")
+        }
+        #endif
+        #endif
     }
 
     private func retryLocalAudioAfterFailure() {
@@ -445,6 +585,7 @@ final class TRTCManager: NSObject, ObservableObject {
     private func startLocalPreviewBeforeRoomEntry() {
         #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
         guard isSDKConfigured,
+              dualCamera == nil, !isChangingCamera,
               activeCallType == .video,
               !isCameraOff,
               let localView else { return }
@@ -477,9 +618,9 @@ final class TRTCManager: NSObject, ObservableObject {
 #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
 extension TRTCManager: TRTCCloudDelegate {
     nonisolated func onError(_ errCode: TXLiteAVError, errMsg: String?, extInfo: [AnyHashable: Any]?) {
-        Task { @MainActor in
-            let message = errMsg?.trimmingCharacters(in: .whitespacesAndNewlines)
-            print("[TRTC] error code=\(errCode.rawValue) message=\(message ?? "") info=\(extInfo ?? [:])")
+        Task { @MainActor [self] in
+            print("[TRTC] error code=\(errCode.rawValue)")
+            logAudioState("sdk_error")
 
             // -1321 is an audio-device startup warning, not a room-entry failure.
             // Retry once after the audio session has settled, then keep the call UI usable.
@@ -551,6 +692,7 @@ extension TRTCManager: TRTCCloudDelegate {
     nonisolated func onUserAudioAvailable(_ userId: String, available: Bool) {
         Task { @MainActor in
             upsertRemoteUser(userId, hasAudio: available)
+            logAudioState("remote_audio_availability")
         }
     }
 
@@ -576,10 +718,40 @@ extension TRTCManager: TRTCCloudDelegate {
                     upsertRemoteUser(userId, volume: Int(item.volume))
                 }
             }
+            #if DEBUG
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastAudioDiagnosticTime >= 5 {
+                lastAudioDiagnosticTime = now
+                print("[CallAudio] localLevel=\(localVolume) remoteMaxLevel=\(remoteParticipants.map(\.volume).max() ?? 0) totalLevel=\(totalVolume)")
+                logAudioState("volume_sample")
+            }
+            #endif
         }
     }
 }
 #endif
+
+/// The small lock is an SDK send/teardown gate, not a media queue or async wait.
+/// Invalidation waits for a current send to finish before exitRoom switches SDK modes.
+private final class TRTCCompositeVideoSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enabled = true
+    func invalidate() { lock.lock(); enabled = false; lock.unlock() }
+    func send(_ buffer: CVPixelBuffer, pts: CMTime) {
+        lock.lock(); defer { lock.unlock() }
+        guard enabled else { return }
+        #if canImport(TXLiteAVSDK_Professional) || canImport(TXLiteAVSDK_TRTC)
+        let frame = TRTCVideoFrame()
+        frame.pixelFormat = ._32BGRA
+        frame.bufferType = .pixelBuffer
+        frame.pixelBuffer = buffer
+        frame.width = UInt32(CVPixelBufferGetWidth(buffer))
+        frame.height = UInt32(CVPixelBufferGetHeight(buffer))
+        frame.timestamp = TRTCCloud.generateCustomPTS()
+        TRTCCloud.sharedInstance().sendCustomVideoData(.big, frame: frame)
+        #endif
+    }
+}
 
 struct TRTCVideoCanvas: UIViewRepresentable {
     enum Role {

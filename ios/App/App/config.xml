@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" id="com.imim.chat" version="1.0.0">
+  <name>imimchat</name>
+  <description>IMIM Chat iOS App</description>
+  <author>IMIM</author>
+  <content src="https://wed.imim.chat" />
+  <access origin="*" />
+  <preference name="scheme" value="imimchat" />
+</widget>

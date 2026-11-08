@@ -3,6 +3,8 @@ import SwiftUI
 import UIKit
 
 enum DoveTheme {
+    /// Explicit root canvas, independent of a stale child UIHostingView trait.
+    static func windowCanvas(isDarkMode: Bool) -> UIColor { isDarkMode ? .black : .white }
     private static let lightAccent = UIColor(red: 43.0 / 255.0, green: 162.0 / 255.0, blue: 69.0 / 255.0, alpha: 1)
     // Keep the product green in both appearances. Dark mode only raises luminance.
     private static let darkAccent = UIColor(red: 0.23, green: 0.78, blue: 0.38, alpha: 1)
@@ -53,12 +55,72 @@ enum DoveTheme {
     }
 }
 
+/// Keep the actual containing UIKit window and SwiftUI's saved preference in
+/// agreement. Never enumerate/modify other scenes, keyboards or media windows.
+@MainActor
+struct AppWindowAppearanceBridge: UIViewRepresentable {
+    let isDarkMode: Bool
+    func makeUIView(context: Context) -> AppWindowAppearanceAnchor {
+        let view = AppWindowAppearanceAnchor(frame: .zero)
+        view.isUserInteractionEnabled = false
+        view.isAccessibilityElement = false
+        view.updateAppearance(isDarkMode: isDarkMode)
+        return view
+    }
+    func updateUIView(_ view: AppWindowAppearanceAnchor, context: Context) {
+        view.updateAppearance(isDarkMode: isDarkMode)
+    }
+}
+
+@MainActor
+final class AppWindowAppearanceAnchor: UIView {
+    private var isDarkMode = false
+    private var synchronizationScheduled = false
+
+    func updateAppearance(isDarkMode: Bool) {
+        self.isDarkMode = isDarkMode
+        scheduleSynchronization()
+    }
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        scheduleSynchronization()
+    }
+    private func scheduleSynchronization() {
+        guard !synchronizationScheduled else { return }
+        synchronizationScheduled = true
+        // Updating an ancestor's traits within updateUIView can reenter the
+        // SwiftUI render transaction. Coalesce onto the next main-queue turn,
+        // reading the latest preference AND the then-current containing window.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.synchronizationScheduled = false
+            self.synchronizeWindow()
+        }
+    }
+    private func synchronizeWindow() {
+        guard let window else { return }
+        let style: UIUserInterfaceStyle = isDarkMode ? .dark : .light
+        let canvas = DoveTheme.windowCanvas(isDarkMode: isDarkMode)
+        let windowStyleChanged = window.overrideUserInterfaceStyle != style
+        if windowStyleChanged { window.overrideUserInterfaceStyle = style }
+        if window.backgroundColor != canvas { window.backgroundColor = canvas }
+        if let root = window.rootViewController {
+            let rootStyleChanged = root.overrideUserInterfaceStyle != style
+            if rootStyleChanged { root.overrideUserInterfaceStyle = style }
+            if root.isViewLoaded, root.view.backgroundColor != canvas { root.view.backgroundColor = canvas }
+            if windowStyleChanged || rootStyleChanged { root.setNeedsStatusBarAppearanceUpdate() }
+        }
+    }
+}
+
 struct DoveAvatar: View {
     let name: String
     var url: String?
+    var userId: String? = nil
     var size: CGFloat = 48
     var isGroup = false
     var isOnline = false
+    var allowsSourceUpdates = false
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -80,30 +142,33 @@ struct DoveAvatar: View {
 
     @ViewBuilder
     private var avatarContent: some View {
-        if let image = AvatarStore.image(from: url) {
+        if !isGroup, userId != nil, userId == UserDefaults.standard.string(forKey: "current_user_id"),
+           let image = AvatarStore.image(from: url) {
             Image(uiImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
-        } else if let url, let imageURL = remoteImageURL(from: url) {
-            KFImage(imageURL)
-                .placeholder {
-                    placeholder
-                }
-                .retry(maxCount: 2, interval: .seconds(1))
-                .cacheOriginalImage()
-                .fade(duration: 0.18)
+        } else if let assetName = bundledAssetName(from: url) {
+            Image(assetName)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
         } else {
-            placeholder
+            DoveCachedAvatarImage(name: name, url: url, userId: userId, size: size, isGroup: isGroup,
+                                  allowsSourceUpdates: allowsSourceUpdates)
         }
+    }
+
+    private func bundledAssetName(from value: String?) -> String? {
+        let prefix = "asset://"
+        guard let value, value.hasPrefix(prefix) else { return nil }
+        let name = String(value.dropFirst(prefix.count))
+        return name.isEmpty ? nil : name
     }
 
     private func remoteImageURL(from value: String) -> URL? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.lowercased() != "null" else { return nil }
         if trimmed.hasPrefix("/") {
-            return URL(string: "https://wed.imim.chat\(trimmed)")
+            return URL(string: "\(AppServer.origin)\(trimmed)")
         }
         guard let url = URL(string: trimmed),
               ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
@@ -129,6 +194,55 @@ struct DoveAvatar: View {
                     .foregroundStyle(DoveTheme.green)
             }
         }
+    }
+}
+
+/// UIImageView normally uses the downloaded image's pixel size as its intrinsic
+/// size. Avatar layout must instead remain fixed before and after cache delivery.
+final class DoveAvatarImageView: UIImageView {
+    var avatarSize: CGFloat = 48 {
+        didSet {
+            if oldValue != avatarSize { invalidateIntrinsicContentSize() }
+        }
+    }
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: avatarSize, height: avatarSize)
+    }
+}
+
+/// Only avatar loading changes; the surrounding 46 layout/shape stays intact.
+struct DoveCachedAvatarImage: UIViewRepresentable {
+    let name: String
+    let url: String?
+    let userId: String?
+    let size: CGFloat
+    let isGroup: Bool
+    var allowsSourceUpdates = false
+    var placeholderImage: UIImage? = nil
+
+    func makeUIView(context: Context) -> DoveAvatarImageView {
+        let view = DoveAvatarImageView(frame: CGRect(x: 0, y: 0, width: size, height: size))
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        updateUIView(view, context: context)
+        return view
+    }
+
+    func updateUIView(_ view: DoveAvatarImageView, context: Context) {
+        view.avatarSize = size
+        AvatarImageLoader.loadAvatar(urlString: url, userId: userId, name: name, isGroup: isGroup,
+                                     allowsSourceUpdates: allowsSourceUpdates, placeholder: placeholderImage, into: view)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: DoveAvatarImageView, context: Context) -> CGSize? {
+        CGSize(width: size, height: size)
+    }
+
+    static func dismantleUIView(_ view: DoveAvatarImageView, coordinator: ()) {
+        AvatarImageLoader.shared.unbind(view)
     }
 }
 
@@ -168,6 +282,7 @@ struct DoveIconButton: View {
 struct DoveSearchBar: View {
     @Binding var text: String
     var placeholder = "搜索"
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         HStack(spacing: 8) {
@@ -175,10 +290,11 @@ struct DoveSearchBar: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            TextField(placeholder, text: $text)
+            TextField(LocalizedStringKey(placeholder), text: $text)
                 .font(.system(size: 14))
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .focused($isFocused)
 
             if !text.isEmpty {
                 Button {
@@ -191,8 +307,13 @@ struct DoveSearchBar: View {
             }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 11)
-        .background(DoveTheme.warmGray.opacity(0.72), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .frame(minHeight: 46)
+        .background(DoveTheme.warmGray.opacity(isFocused ? 0.48 : 0.62), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isFocused ? DoveTheme.green.opacity(0.30) : DoveTheme.ink.opacity(0.06), lineWidth: 0.8)
+        }
+        .animation(.easeInOut(duration: 0.18), value: isFocused)
     }
 }
 
@@ -209,7 +330,7 @@ struct DoveSegmentedControl<Selection: Hashable>: View {
                     }
                 } label: {
                     HStack(spacing: 5) {
-                        Text(item.1)
+                        AppLocalizedText(item.1)
                         if item.2 > 0 {
                             DoveUnreadBadge(count: item.2)
                         }

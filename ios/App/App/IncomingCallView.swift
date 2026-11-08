@@ -32,7 +32,7 @@ struct IncomingCallView: View {
                         .font(.system(size: 32, weight: .bold))
                         .foregroundColor(.white)
                     
-                    Text("正在邀请你进行\(callType)...")
+                    Text("正在邀请你进行\(AppLocalization.string(callType))...")
                         .font(.system(size: 18))
                         .foregroundColor(.white.opacity(0.8))
                 }

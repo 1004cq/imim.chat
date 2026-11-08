@@ -28,12 +28,21 @@ struct ChatConversationModel: Identifiable, Equatable {
         unreadCount = chat.isMuted ? 0 : chat.unreadCount
         isGroup = chat.type == "group"
         isVerified = chat.isOfficial || chat.isBot
-        isEncrypted = chat.isEncrypted
-        isOnline = chat.type == "private" && !chat.isOfficial && !chat.isBot
+        isEncrypted = chat.isEncrypted && !AIConversation.matches(chat.chatId)
+        isOnline = false // Real presence is injected by the observing row, not inferred from chat type.
         lastTimestamp = chat.updatedAt
         isMuted = chat.isMuted
         isPinned = chat.isPinned
     }
+}
+
+/// Transient row input, not another persistence/cache layer. Keep the action
+/// target beside its display value so lazy rows never search the entire query.
+struct ChatConversationRow: Identifiable {
+    let chat: Chat
+    let conversation: ChatConversationModel
+
+    var id: String { conversation.id }
 }
 
 @MainActor
@@ -47,9 +56,64 @@ final class IMConversationViewModel: ObservableObject {
     @Published var filter: Filter = .all
     @Published var isRefreshing = false
     @Published var errorMessage: String?
+    private var activeRefreshID: UUID?
 
-    func conversations(from chats: [Chat]) -> [ChatConversationModel] {
-        filteredChats(from: chats).map { ChatConversationModel(chat: $0, subtitle: displaySubtitle(for: $0)) }
+    // MARK: - Memoized row computation
+    // Presence updates (FriendPresenceStore) cause frequent re-renders. Avoid
+    // re-sorting and re-mapping the full chat list when nothing relevant changed.
+
+    private struct ChatListSnapshot: Equatable {
+        let searchText: String
+        let filter: Filter
+        let language: String
+        let calendarDay: Date
+        let items: [ItemKey]
+
+        struct ItemKey: Equatable {
+            let object: ObjectIdentifier
+            let id: String
+            let avatar: String?
+            let type: String
+            let isMuted: Bool
+            let isEncrypted: Bool
+            let updatedAt: Double
+            let unreadCount: Int
+            let isPinned: Bool
+            let isOfficial: Bool
+            let isBot: Bool
+            let name: String
+            let lastMessage: String
+        }
+    }
+
+    private var cachedConversationRows: [ChatConversationRow] = []
+    private var cachedConversationSnapshot: ChatListSnapshot?
+
+    func conversationRows(from chats: [Chat]) -> [ChatConversationRow] {
+        let snapshot = ChatListSnapshot(
+            searchText: searchText,
+            filter: filter,
+            language: AppLanguage.current.resolvedIdentifier + "|" + Locale.current.identifier + "|" + TimeZone.current.identifier,
+            calendarDay: Calendar.current.startOfDay(for: Date()),
+            items: chats.map {
+                .init(object: ObjectIdentifier($0), id: $0.chatId, avatar: $0.avatar, type: $0.type,
+                      isMuted: $0.isMuted, isEncrypted: $0.isEncrypted,
+                      updatedAt: $0.updatedAt.timeIntervalSinceReferenceDate,
+                      unreadCount: $0.unreadCount,
+                      isPinned: $0.isPinned,
+                      isOfficial: $0.isOfficial,
+                      isBot: $0.isBot,
+                      name: $0.name,
+                      lastMessage: $0.lastMessage)
+            }
+        )
+        guard snapshot != cachedConversationSnapshot else { return cachedConversationRows }
+        let rows = filteredChats(from: chats).map { chat in
+            ChatConversationRow(chat: chat, conversation: ChatConversationModel(chat: chat, subtitle: displaySubtitle(for: chat)))
+        }
+        cachedConversationSnapshot = snapshot
+        cachedConversationRows = rows
+        return rows
     }
 
     func filteredChats(from chats: [Chat]) -> [Chat] {
@@ -81,6 +145,7 @@ final class IMConversationViewModel: ObservableObject {
     }
 
     func togglePinned(_ chat: Chat, modelContext: ModelContext) {
+        guard !chat.isBuiltinSystemConversation else { return }
         chat.isPinned.toggle()
         try? modelContext.save()
     }
@@ -94,45 +159,94 @@ final class IMConversationViewModel: ObservableObject {
     func displaySubtitle(for chat: Chat) -> String {
         let content = chat.lastMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         if content.isEmpty {
-            return "还没有消息"
+            return AppLocalization.string("还没有消息")
         }
         if content == "[加密消息]" || content == "🔒 [加密消息]" || content == "🔒 加密消息" || content.contains("等待密钥同步") {
-            return "加密消息"
+            return AppLocalization.string("加密消息")
         }
         if content.contains("voice") || content.contains("语音") {
-            return "语音"
+            return AppLocalization.string("语音")
         }
         if content.contains("sticker") || content.contains("贴纸") {
-            return "贴纸"
+            return AppLocalization.string("贴纸")
         }
         if content.contains("image") || content.contains("图片") {
-            return "图片"
+            return AppLocalization.string("图片")
         }
         if content.contains("file") || content.contains("文件") {
-            return "文件"
+            return AppLocalization.string("文件")
         }
         return content
     }
 
     func refresh(chats: [Chat], modelContext: ModelContext) async {
+        guard !Task.isCancelled else { return }
+        let refreshID = UUID()
+        activeRefreshID = refreshID
+        let ownerID = UserDefaults.standard.string(forKey: "current_user_id")
+        let token = AuthTokenStore.shared.token
+        // Only the latest refresh for the same signed-in account may merge or
+        // publish UI state after a suspension. Older requests can finish late.
+        func canApply() -> Bool {
+            activeRefreshID == refreshID && !Task.isCancelled
+                && AuthTokenStore.shared.token == token
+                && UserDefaults.standard.string(forKey: "current_user_id") == ownerID
+        }
+        defer {
+            if activeRefreshID == refreshID { isRefreshing = false }
+        }
+        errorMessage = nil
         ensureBuiltinConversations(in: chats, modelContext: modelContext)
-        if AuthTokenStore.shared.token == nil {
+        // SwiftData paints first; no awaiting disk IO or network downloads here.
+        AvatarImageLoader.shared.prefetch(chats.map {
+            .init(userId: $0.avatarCacheIdentity, urlString: $0.avatar, isGroup: $0.type == "group")
+        } + [.init(userId: UserDefaults.standard.string(forKey: "current_user_id"),
+                   urlString: UserDefaults.standard.string(forKey: "current_user_avatar"))], allowsSourceUpdates: false)
+        if token == nil {
             return
         }
 
         isRefreshing = true
-        errorMessage = nil
-        defer { isRefreshing = false }
+
+        var refreshErrors: [String] = []
 
         do {
             let remoteChats = try await APIClient.shared.fetchChats()
+            guard canApply() else { return }
             merge(remoteChats: remoteChats, into: chats, modelContext: modelContext)
         } catch {
-            errorMessage = error.localizedDescription
+            guard canApply(), !Self.isRefreshCancellation(error) else { return }
+            refreshErrors.append("私聊：\(error.localizedDescription)")
+        }
+
+        guard canApply() else { return }
+        if let currentUserId = ownerID,
+           !currentUserId.isEmpty {
+            do {
+                let remoteGroups = try await APIClient.shared.fetchGroups(userId: currentUserId)
+                guard canApply() else { return }
+                merge(remoteGroups: remoteGroups, into: chats, modelContext: modelContext)
+            } catch {
+                guard canApply(), !Self.isRefreshCancellation(error) else { return }
+                refreshErrors.append("群聊：\(error.localizedDescription)")
+            }
+        } else {
+            refreshErrors.append("群聊：缺少当前用户 ID")
+        }
+
+        if canApply() {
+            errorMessage = refreshErrors.isEmpty ? nil : refreshErrors.joined(separator: "；")
         }
     }
 
+    private static func isRefreshCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+    }
+
     func delete(_ chat: Chat, modelContext: ModelContext) {
+        guard !chat.isBuiltinSystemConversation else { return }
         modelContext.delete(chat)
         try? modelContext.save()
     }
@@ -143,6 +257,10 @@ final class IMConversationViewModel: ObservableObject {
         var didChange = false
         for (index, sample) in SampleChatData.builtinConversations.enumerated() {
             if let existing = chats.first(where: { $0.chatId == sample.id }) {
+                if existing.avatar != sample.avatar {
+                    existing.avatar = sample.avatar
+                    didChange = true
+                }
                 if sample.isOfficial && !existing.isOfficial {
                     existing.isOfficial = true
                     didChange = true
@@ -161,6 +279,7 @@ final class IMConversationViewModel: ObservableObject {
             let chat = Chat(
                 chatId: sample.id,
                 name: sample.name,
+                avatar: sample.avatar,
                 type: sample.isGroup ? "group" : "private",
                 unreadCount: sample.unreadCount,
                 lastMessage: sample.lastMessage,
@@ -198,8 +317,14 @@ final class IMConversationViewModel: ObservableObject {
                 existing.name = remoteChat.peer?.nickname ?? remoteChat.peer?.username ?? existing.name
                 existing.avatar = remoteChat.peer?.avatar
                 existing.unreadCount = remoteChat.unreadCount ?? 0
-                existing.lastMessage = remoteChat.lastMessage ?? ""
-                existing.updatedAt = Date(milliseconds: remoteChat.lastMessageAt ?? remoteChat.createdAt)
+                let remoteDate = Date(milliseconds: remoteChat.lastMessageAt ?? remoteChat.createdAt)
+                let localCall = existing.messages.compactMap(CallHistoryEntry.decode).compactMap(\.endedAt).max()
+                if let localCall, localCall > remoteDate {
+                    existing.updatedAt = max(existing.updatedAt, localCall)
+                } else {
+                    existing.lastMessage = remoteChat.lastMessage ?? ""
+                    existing.updatedAt = remoteDate
+                }
                 existing.type = "private"
                 existing.isEncrypted = true
                 existing.memberIds = [remoteChat.participantA, remoteChat.participantB]
@@ -209,6 +334,63 @@ final class IMConversationViewModel: ObservableObject {
         }
 
         try? modelContext.save()
+        CallHistoryStore.shared.flushPending()
+        AvatarImageLoader.shared.prefetch(remoteChats.compactMap { remote in
+            guard let peer = remote.peer, peer.id != currentUserId,
+                  [remote.participantA, remote.participantB].contains(peer.id) else { return nil }
+            return .init(userId: peer.id, urlString: peer.avatar)
+        })
+    }
+
+    func merge(remoteGroups: [RemoteGroup], into localChats: [Chat], modelContext: ModelContext) {
+        let currentUserId = UserDefaults.standard.string(forKey: "current_user_id")
+
+        for remoteGroup in remoteGroups {
+            guard let groupId = remoteGroup.resolvedId else { continue }
+            let normalizedName = remoteGroup.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let existing = localChats.first {
+                $0.chatId == groupId || $0.chatId == "group_\(groupId)"
+            }
+            let timestamp = remoteGroup.updatedAt ?? remoteGroup.createdAt
+
+            if let existing {
+                if let normalizedName, !normalizedName.isEmpty {
+                    existing.name = normalizedName
+                }
+                if let avatar = remoteGroup.avatar {
+                    existing.avatar = avatar
+                }
+                existing.type = "group"
+                existing.unreadCount = remoteGroup.unreadCount ?? existing.unreadCount
+                if let lastMessage = remoteGroup.lastMessage, !lastMessage.isEmpty {
+                    existing.lastMessage = lastMessage
+                }
+                if let timestamp {
+                    existing.updatedAt = Date(milliseconds: timestamp)
+                }
+                existing.isEncrypted = true
+                if let currentUserId, !existing.memberIds.contains(currentUserId) {
+                    existing.memberIds.append(currentUserId)
+                }
+            } else {
+                modelContext.insert(Chat(
+                    chatId: groupId,
+                    name: normalizedName.flatMap { $0.isEmpty ? nil : $0 } ?? "未命名群聊",
+                    avatar: remoteGroup.avatar,
+                    type: "group",
+                    unreadCount: remoteGroup.unreadCount ?? 0,
+                    lastMessage: remoteGroup.lastMessage ?? "",
+                    updatedAt: timestamp.map { Date(milliseconds: $0) } ?? Date(),
+                    isEncrypted: true,
+                    memberIds: currentUserId.map { [$0] } ?? []
+                ))
+            }
+        }
+
+        try? modelContext.save()
+        AvatarImageLoader.shared.prefetch(remoteGroups.map {
+            .init(userId: $0.resolvedId, urlString: $0.avatar, isGroup: true)
+        })
     }
 
     /// WebSocket 到达新消息时立即更新列表，不等待下一次完整网络刷新。
@@ -229,6 +411,7 @@ final class IMConversationViewModel: ObservableObject {
 
     private func previewText(for message: Message) -> String {
         switch message.type {
+        case "call": return CallHistoryEntry.decode(message)?.titleKey ?? "通话记录不可用"
         case "voice": return "语音"
         case "image": return "图片"
         case "video": return "视频"
@@ -246,10 +429,17 @@ final class IMConversationViewModel: ObservableObject {
 
 typealias ChatsViewModel = IMConversationViewModel
 
+extension Chat {
+    var isBuiltinSystemConversation: Bool {
+        chatId == "official" || chatId == "bot"
+    }
+}
+
 private enum SampleChatData {
     struct Conversation {
         let id: String
         let name: String
+        let avatar: String
         let lastMessage: String
         let unreadCount: Int
         let isGroup: Bool
@@ -262,7 +452,7 @@ private enum SampleChatData {
     }
 
     static let builtinConversations = [
-        Conversation(id: "official", name: "imim 官方", lastMessage: "欢迎使用 imim！点击查看新手指南 →", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: true, isBot: false),
-        Conversation(id: "bot", name: "imim AI", lastMessage: "你好，我是 imim AI，请直接告诉我你的问题。", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: false, isBot: true),
+        Conversation(id: "official", name: "imim 官方", avatar: "asset://ImimOfficialAvatar", lastMessage: "欢迎使用 imim！点击查看新手指南 →", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: true, isBot: false),
+        Conversation(id: "bot", name: "imim AI", avatar: "asset://ImimAIAvatar", lastMessage: "你好，我是 imim AI，请直接告诉我你的问题。", unreadCount: 0, isGroup: false, isOutgoing: false, isPinned: true, isMuted: false, isEncrypted: true, isOfficial: false, isBot: true),
     ]
 }
